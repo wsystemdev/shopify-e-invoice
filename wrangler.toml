@@ -1,0 +1,15 @@
+name = "w-system-e-invoice-shopify"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Free tier only. Create the namespace once: wrangler kv namespace create STORE, then paste the id.
+[[kv_namespaces]]
+binding = "STORE"
+id = "REPLACE_WITH_KV_ID"
+
+[vars]
+APP_URL = "https://REPLACE.workers.dev"
+SHOPIFY_API_VERSION = "2026-07"
+API_BASE = "https://api.wsystem.dev"
+EMAIL_COPY_ENABLED = "0"
+# Secrets (wrangler secret put): SHOPIFY_API_KEY, SHOPIFY_API_SECRET, ENC_KEY (32+ random chars), RESEND_API_KEY (only if EMAIL_COPY_ENABLED=1)

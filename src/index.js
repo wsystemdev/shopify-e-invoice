@@ -1,0 +1,227 @@
+import { buildInvoice, parseResult, isB2B, DEFAULT_SETTINGS, orderNumber } from "./mapper.js";
+import { hmac, safeEq, seal, unseal, verifySessionToken } from "./crypto.js";
+import { adminPage } from "./admin.js";
+
+const SHOP_RE = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
+const TTL = 60 * 60 * 24 * 400; // invoices expire after about 13 months
+const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
+const SECRET_FIELD = "api_key";
+
+// ---------- storage ----------
+async function getShop(env, shop) {
+  const raw = await env.STORE.get(`shop:${shop}`, "json");
+  if (!raw) return null;
+  const out = { settings: { ...DEFAULT_SETTINGS, ...(raw.settings || {}) }, token: "" };
+  if (raw.token) out.token = await unseal(env.ENC_KEY, raw.token);
+  if (raw.settings && raw.settings[SECRET_FIELD]) out.settings[SECRET_FIELD] = await unseal(env.ENC_KEY, raw.settings[SECRET_FIELD]);
+  return out;
+}
+async function putShop(env, shop, { token, settings }) {
+  const s = { ...settings };
+  if (s[SECRET_FIELD]) s[SECRET_FIELD] = await seal(env.ENC_KEY, s[SECRET_FIELD]);
+  await env.STORE.put(`shop:${shop}`, JSON.stringify({ token: token ? await seal(env.ENC_KEY, token) : "", settings: s }));
+}
+export async function deleteShopData(env, shop) {
+  for (const prefix of [`inv:${shop}:`, `dsr:${shop}:`]) {
+    let cursor;
+    do {
+      const l = await env.STORE.list({ prefix, cursor });
+      await Promise.all(l.keys.map((k) => env.STORE.delete(k.name)));
+      cursor = l.list_complete ? undefined : l.cursor;
+    } while (cursor);
+  }
+  await env.STORE.delete(`shop:${shop}`);
+}
+
+// ---------- Shopify ----------
+async function verifyWebhook(env, req, body) {
+  const h = req.headers.get("x-shopify-hmac-sha256") || "";
+  return safeEq(await hmac(env.SHOPIFY_API_SECRET, body, "base64"), h);
+}
+async function verifyQuery(env, url) {
+  const p = new URLSearchParams(url.search);
+  const given = p.get("hmac") || "";
+  p.delete("hmac");
+  const msg = [...p.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join("&");
+  return safeEq(await hmac(env.SHOPIFY_API_SECRET, msg), given);
+}
+async function shopifyFetch(env, shop, token, path, init = {}) {
+  const r = await fetch(`https://${shop}/admin/api/${env.SHOPIFY_API_VERSION}${path}`, { ...init, headers: { "X-Shopify-Access-Token": token, "content-type": "application/json", ...(init.headers || {}) } });
+  if (!r.ok) throw new Error(`Shopify ${r.status}`);
+  return r.json();
+}
+// OAuth 2.0 token exchange (Shopify managed installation): session token -> offline access token.
+async function exchangeToken(env, shop, idToken) {
+  const r = await fetch(`https://${shop}/admin/oauth/access_token`, {
+    method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ client_id: env.SHOPIFY_API_KEY, client_secret: env.SHOPIFY_API_SECRET, grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+      subject_token: idToken, subject_token_type: "urn:ietf:params:oauth:token-type:id_token", requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token" }),
+  });
+  if (!r.ok) throw new Error(`token exchange ${r.status}`);
+  return (await r.json()).access_token;
+}
+const dlUrl = async (env, shop, id) => `${env.APP_URL}/d/${shop}/${id}?t=${(await hmac(env.ENC_KEY, `dl|${shop}|${id}`)).slice(0, 32)}`;
+
+// ---------- invoice lifecycle ----------
+export async function generate(env, shop, order, shopData, { force = false, f = fetch } = {}) {
+  const key = `inv:${shop}:${order.id}`;
+  if (!force && (await env.STORE.get(key))) return { skipped: "exists" };
+  const s = shopData.settings;
+  const body = buildInvoice(order, s);
+  const headers = { "content-type": "application/json", "user-agent": "w-system-e-invoice-shopify/1.0" };
+  if (s.api_key) headers["x-api-key"] = s.api_key;
+  let res, data;
+  try {
+    res = await f(`${env.API_BASE || "https://api.wsystem.dev"}/einvoice/create`, { method: "POST", headers, body: JSON.stringify(body) });
+    data = await res.json();
+  } catch (e) { data = null; }
+  let rec;
+  if (!res || !res.ok || !data) {
+    const msg = data && (data.detail || data.error) ? JSON.stringify(data.detail || data.error).slice(0, 300) : `API error ${res ? res.status : "unreachable"}`;
+    rec = { order: orderNumber(order), number: body.invoice_number, valid: false, xml: "", errors: [{ rule_id: "API", message: msg, fix: "" }], created: new Date().toISOString() };
+  } else {
+    const p = parseResult(data, order.current_total_price ?? order.total_price);
+    rec = { order: orderNumber(order), number: body.invoice_number, format: body.format, valid: p.valid, xml: p.valid ? p.xml : "", errors: p.errors, mismatch: p.mismatch, created: new Date().toISOString() };
+  }
+  await env.STORE.put(key, JSON.stringify(rec), { expirationTtl: TTL, metadata: { order: rec.order, number: rec.number, valid: rec.valid, created: rec.created } });
+  // tag + metafield on the order (needs the access token)
+  if (shopData.token) {
+    try {
+      const tags = String(order.tags || "").split(",").map((x) => x.trim()).filter((x) => x && !/^e-invoice-/.test(x));
+      tags.push(rec.valid ? "e-invoice-valid" : "e-invoice-failed");
+      const o = { id: order.id, tags: tags.join(", ") };
+      if (rec.valid) o.metafields = [{ namespace: "wsystem", key: "einvoice_url", type: "url", value: await dlUrl(env, shop, order.id) }];
+      await shopifyFetch(env, shop, shopData.token, `/orders/${order.id}.json`, { method: "PUT", body: JSON.stringify({ order: o }) });
+    } catch (e) { /* tagging is best effort */ }
+  }
+  if (rec.valid && s.email_copy === "yes" && env.EMAIL_COPY_ENABLED === "1" && env.RESEND_API_KEY && s.seller_email) {
+    try {
+      await f("https://api.resend.com/emails", { method: "POST", headers: { authorization: `Bearer ${env.RESEND_API_KEY}`, "content-type": "application/json" },
+        body: JSON.stringify({ from: "W System <hello@wsystem.dev>", to: [s.seller_email], subject: `E-invoice ${rec.number} (${shop})`, text: `The e-invoice for order ${rec.order} passed validation. The XML is attached.`,
+          attachments: [{ filename: `${rec.number}.xml`, content: btoa(unescape(encodeURIComponent(rec.xml))) }] }) });
+    } catch (e) { /* ignore */ }
+  }
+  return rec;
+}
+
+async function onOrderWebhook(env, req, body, topic) {
+  const shop = (req.headers.get("x-shopify-shop-domain") || "").toLowerCase();
+  if (!SHOP_RE.test(shop)) return;
+  const sd = await getShop(env, shop);
+  if (!sd) return;
+  const trig = sd.settings.trigger;
+  if (trig === "off" || (topic === "create" && trig !== "created") || (topic === "paid" && trig !== "paid")) return;
+  const order = JSON.parse(body);
+  if (sd.settings.only_b2b === "yes" && !isB2B(order, sd.settings)) return;
+  await generate(env, shop, order, sd);
+}
+
+async function onCompliance(env, body) {
+  const p = JSON.parse(body);
+  const shop = String(p.shop_domain || "").toLowerCase();
+  if (!SHOP_RE.test(shop)) return;
+  const topic = p.__topic;
+  if (topic === "shop/redact") return deleteShopData(env, shop);
+  if (topic === "customers/redact") {
+    for (const id of p.orders_to_redact || []) await env.STORE.delete(`inv:${shop}:${id}`);
+    return;
+  }
+  if (topic === "customers/data_request") {
+    // Invoices are stored per order and visible to the merchant in the app; record the request so the merchant can fulfil it.
+    await env.STORE.put(`dsr:${shop}:${p.data_request && p.data_request.id || Date.now()}`, JSON.stringify({ orders: p.orders_requested || [], at: new Date().toISOString() }), { expirationTtl: TTL });
+  }
+}
+
+// ---------- router ----------
+export default {
+  async fetch(req, env, ctx) {
+    const url = new URL(req.url);
+    const path = url.pathname;
+    try {
+      if (path === "/" || path === "/health") return json({ ok: true, app: "w-system-e-invoice-shopify" });
+
+      if (req.method === "POST" && path.startsWith("/webhooks/")) {
+        const body = await req.text();
+        if (!(await verifyWebhook(env, req, body))) return new Response("invalid hmac", { status: 401 });
+        const topicHdr = (req.headers.get("x-shopify-topic") || "").toLowerCase();
+        if (path === "/webhooks/orders-create") ctx.waitUntil(onOrderWebhook(env, req, body, "create"));
+        else if (path === "/webhooks/orders-paid") ctx.waitUntil(onOrderWebhook(env, req, body, "paid"));
+        else if (path === "/webhooks/app-uninstalled") {
+          const shop = (req.headers.get("x-shopify-shop-domain") || "").toLowerCase();
+          if (SHOP_RE.test(shop)) { const sd = await getShop(env, shop); if (sd) await putShop(env, shop, { token: "", settings: sd.settings }); }
+        } else if (path === "/webhooks/compliance") {
+          const p = JSON.parse(body); p.__topic = topicHdr; ctx.waitUntil(onCompliance(env, JSON.stringify(p)));
+        } else return new Response("not found", { status: 404 });
+        return new Response("ok", { status: 200 });
+      }
+
+      if (path === "/app" || path === "/app/") {
+        const shop = (url.searchParams.get("shop") || "").toLowerCase();
+        if (!SHOP_RE.test(shop) || !(await verifyQuery(env, url))) return new Response("Open this app from your Shopify admin.", { status: 400 });
+        return new Response(adminPage({ apiKey: env.SHOPIFY_API_KEY, shop, host: url.searchParams.get("host"), locale: url.searchParams.get("locale") }), {
+          headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": `frame-ancestors https://${shop} https://admin.shopify.com`, "cache-control": "no-store" } });
+      }
+
+      if (path.startsWith("/d/")) {
+        const [, , shop, id] = path.split("/");
+        const t = url.searchParams.get("t") || "";
+        if (!SHOP_RE.test(shop || "") || !/^\d+$/.test(id || "") || !safeEq((await hmac(env.ENC_KEY, `dl|${shop}|${id}`)).slice(0, 32), t)) return new Response("not found", { status: 404 });
+        const rec = await env.STORE.get(`inv:${shop}:${id}`, "json");
+        if (!rec || !rec.valid || !rec.xml) return new Response("not found", { status: 404 });
+        return new Response(rec.xml, { headers: { "content-type": "application/xml; charset=utf-8", "content-disposition": `attachment; filename="${String(rec.number).replace(/[^\w.-]/g, "_")}.xml"`, "cache-control": "no-store" } });
+      }
+
+      if (path.startsWith("/api/")) {
+        const bearer = (req.headers.get("authorization") || "").replace(/^Bearer /, "");
+        const sess = await verifySessionToken(bearer, env.SHOPIFY_API_SECRET, env.SHOPIFY_API_KEY);
+        if (!sess) return json({ error: "unauthorized" }, 401);
+        const shop = sess.shop;
+        let sd = await getShop(env, shop);
+        if (!sd || !sd.token) {
+          const token = await exchangeToken(env, shop, bearer);
+          sd = { settings: sd ? sd.settings : { ...DEFAULT_SETTINGS }, token };
+          await putShop(env, shop, sd);
+        }
+        if (path === "/api/settings" && req.method === "GET") {
+          const s = { ...sd.settings }; if (s.api_key) s.api_key = "********";
+          return json({ settings: s });
+        }
+        if (path === "/api/settings" && req.method === "POST") {
+          const d = await req.json(); const s = { ...sd.settings };
+          for (const k of Object.keys(DEFAULT_SETTINGS)) {
+            if (typeof d[k] !== "string") continue;
+            if (k === "api_key" && d[k] === "********") continue;
+            s[k] = d[k].trim().slice(0, 300);
+          }
+          if (!["xrechnung", "en16931", "peppol-bis3"].includes(s.format)) s.format = "xrechnung";
+          if (!["paid", "created", "off"].includes(s.trigger)) s.trigger = "paid";
+          await putShop(env, shop, { token: sd.token, settings: s });
+          return json({ ok: true });
+        }
+        if (path === "/api/invoices") {
+          const l = await env.STORE.list({ prefix: `inv:${shop}:`, limit: 200 });
+          const invoices = await Promise.all(l.keys.map(async (k) => {
+            const m = k.metadata || {}; const id = k.name.split(":")[2];
+            const rec = await env.STORE.get(k.name, "json");
+            return { order: m.order, number: m.number, valid: m.valid, created: m.created, xml: !!(rec && rec.xml), errors: rec ? rec.errors : [], url: await dlUrl(env, shop, id) };
+          }));
+          invoices.sort((a, b) => String(b.created).localeCompare(String(a.created)));
+          return json({ invoices: invoices.slice(0, 25) });
+        }
+        if (path === "/api/create" && req.method === "POST") {
+          const { order: name } = await req.json();
+          const q = encodeURIComponent("#" + String(name).replace(/^#/, ""));
+          const o = await shopifyFetch(env, shop, sd.token, `/orders.json?name=${q}&status=any&limit=1`);
+          const order = (o.orders || [])[0];
+          if (!order) return json({ ok: false, error: "Order not found" });
+          const rec = await generate(env, shop, order, sd, { force: true });
+          return json({ ok: true, valid: rec.valid, errors: rec.errors });
+        }
+        return json({ error: "not found" }, 404);
+      }
+      return new Response("not found", { status: 404 });
+    } catch (e) {
+      return json({ error: "internal error" }, 500);
+    }
+  },
+};
