@@ -28,13 +28,19 @@ export async function unseal(secret, blob) {
 }
 const b64url = (s) => s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (s.length % 4)) % 4);
 // Verify an App Bridge session token (HS256 JWT signed with the app secret).
-export async function verifySessionToken(token, secret, clientId, now = Date.now() / 1000) {
+// Real tokens carry iss = https://<shop>/admin and dest = https://<shop> (no /admin). Returns { shop, claims } or { reason }.
+export async function verifySessionToken(token, secret, clientId, now = Date.now() / 1000, skew = 10) {
   const p = String(token || "").split(".");
-  if (p.length !== 3) return null;
+  if (p.length !== 3) return { reason: token ? "malformed" : "missing" };
+  let h; try { h = JSON.parse(atob(b64url(p[0]))); } catch { return { reason: "bad_header" }; }
+  if (h.alg !== "HS256") return { reason: "alg_" + String(h.alg).slice(0, 10) };
   const sig = (await hmac(secret, p[0] + "." + p[1], "base64")).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  if (!safeEq(sig, p[2])) return null;
-  let c; try { c = JSON.parse(atob(b64url(p[1]))); } catch { return null; }
-  if (c.aud !== clientId || c.exp < now - 5 || c.nbf > now + 5) return null;
-  const m = /^https:\/\/([a-z0-9][a-z0-9-]*\.myshopify\.com)\/admin$/.exec(String(c.dest || ""));
-  return m ? { shop: m[1], claims: c } : null;
+  if (!safeEq(sig, p[2])) return { reason: "bad_signature" };
+  let c; try { c = JSON.parse(atob(b64url(p[1]))); } catch { return { reason: "bad_payload" }; }
+  if (c.aud !== clientId) return { reason: "aud_mismatch" };
+  if (typeof c.exp === "number" && c.exp < now - skew) return { reason: "expired" };
+  if (typeof c.nbf === "number" && c.nbf > now + skew) return { reason: "not_yet_valid" };
+  let host = ""; try { host = new URL(String(c.dest || "")).hostname.toLowerCase(); } catch { return { reason: "bad_dest" }; }
+  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(host)) return { reason: "dest_not_myshopify" };
+  return { shop: host, claims: c };
 }

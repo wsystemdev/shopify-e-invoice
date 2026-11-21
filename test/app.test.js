@@ -13,7 +13,7 @@ const ctx = () => { const p = []; return { waitUntil: (x) => p.push(x), done: ()
 const SHOP = "demo.myshopify.com";
 const b64url = (s) => btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 async function jwt(claims, secret = "sec") { const h = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" })), p = b64url(JSON.stringify(claims)); const sig = (await hmac(secret, h + "." + p, "base64")).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); return `${h}.${p}.${sig}`; }
-const claims = (o = {}) => ({ iss: `https://${SHOP}/admin`, dest: `https://${SHOP}`.replace(/$/, "/admin"), aud: "cid", exp: Date.now() / 1000 + 60, nbf: Date.now() / 1000 - 5, ...o });
+const claims = (o = {}) => ({ iss: `https://${SHOP}/admin`, dest: `https://${SHOP}`, aud: "cid", exp: Date.now() / 1000 + 60, nbf: Date.now() / 1000 - 5, ...o });
 async function wh(env_, path, body, topic, secret = "sec") {
   const raw = JSON.stringify(body); const c = ctx();
   const r = await app.fetch(new Request("https://app.example" + path, { method: "POST", body: raw, headers: { "x-shopify-hmac-sha256": await hmac(secret, raw, "base64"), "x-shopify-shop-domain": SHOP, "x-shopify-topic": topic } }), env_, c);
@@ -24,10 +24,14 @@ const ORDER = { id: 77, name: "#1002", currency: "EUR", taxes_included: true, fi
 
 test("session token verification", async () => {
   assert.equal((await verifySessionToken(await jwt(claims()), "sec", "cid")).shop, SHOP);
-  assert.equal(await verifySessionToken(await jwt(claims(), "wrong"), "sec", "cid"), null);
-  assert.equal(await verifySessionToken(await jwt(claims({ aud: "x" })), "sec", "cid"), null);
-  assert.equal(await verifySessionToken(await jwt(claims({ exp: 1 })), "sec", "cid"), null);
-  assert.equal(await verifySessionToken(await jwt(claims({ dest: "https://evil.com/admin" })), "sec", "cid"), null);
+  // real Shopify shape: dest has no /admin suffix
+  assert.equal((await verifySessionToken(await jwt(claims({ dest: `https://${SHOP}` })), "sec", "cid")).shop, SHOP);
+  assert.equal((await verifySessionToken(await jwt(claims({ nbf: Date.now() / 1000 + 5 })), "sec", "cid")).shop, SHOP); // clock skew
+  assert.equal((await verifySessionToken(await jwt(claims(), "wrong"), "sec", "cid")).reason, "bad_signature");
+  assert.equal((await verifySessionToken(await jwt(claims({ aud: "x" })), "sec", "cid")).reason, "aud_mismatch");
+  assert.equal((await verifySessionToken(await jwt(claims({ exp: 1 })), "sec", "cid")).reason, "expired");
+  assert.equal((await verifySessionToken(await jwt(claims({ dest: "https://evil.com" })), "sec", "cid")).reason, "dest_not_myshopify");
+  assert.equal((await verifySessionToken("", "sec", "cid")).reason, "missing");
 });
 test("seal/unseal roundtrip", async () => { assert.equal(await unseal("k", await seal("k", "hello")), "hello"); });
 test("webhook rejects bad hmac", async () => {

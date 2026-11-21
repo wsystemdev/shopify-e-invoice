@@ -207,7 +207,7 @@ export default {
       if (path.startsWith("/api/")) {
         const bearer = (req.headers.get("authorization") || "").replace(/^Bearer /, "");
         const sess = await verifySessionToken(bearer, env.SHOPIFY_API_SECRET, env.SHOPIFY_API_KEY);
-        if (!sess) return json({ error: "unauthorized" }, 401);
+        if (!sess.shop) { console.log("session token rejected:", sess.reason, "path", path); return json({ error: "unauthorized", reason: sess.reason }, 401); }
         const shop = sess.shop;
         let sd = await getShop(env, shop);
         let tokenError = "";
