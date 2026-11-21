@@ -5,10 +5,10 @@ compatibility_date = "2026-10-01"
 # Free tier only. Create the namespace once: wrangler kv namespace create STORE, then paste the id.
 [[kv_namespaces]]
 binding = "STORE"
-id = "REPLACE_WITH_KV_ID"
+id = "71dc204db06e4d578f799c28aec5f8b0"
 
 [vars]
-APP_URL = "https://REPLACE.workers.dev"
+APP_URL = "https://wsystem.dev/shopify"
 SHOPIFY_API_VERSION = "2026-07"
 API_BASE = "https://api.wsystem.dev"
 EMAIL_COPY_ENABLED = "0"

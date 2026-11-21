@@ -136,7 +136,8 @@ async function onCompliance(env, body) {
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
-    const path = url.pathname;
+    let path = url.pathname.replace(/^\/shopify(?=\/|$)/, "") || "/"; // served under wsystem.dev/shopify/*
+    if (path === "/" && url.searchParams.get("shop")) path = "/app"; // Shopify opens the app URL itself
     try {
       if (path === "/" || path === "/health") return json({ ok: true, app: "w-system-e-invoice-shopify" });
 

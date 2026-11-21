@@ -1,7 +1,7 @@
 # Shopify CLI app configuration (shopify app deploy). Fill client_id after creating the app in the Partner Dashboard.
 name = "W System E-Invoice"
-client_id = "REPLACE_WITH_CLIENT_ID"
-application_url = "https://REPLACE.workers.dev/app"
+client_id = "dc8268505c1ee816dbe0893a2555e45b"
+application_url = "https://wsystem.dev/shopify"
 embedded = true
 
 [access_scopes]
@@ -9,7 +9,7 @@ scopes = "read_orders,write_orders"
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = ["https://REPLACE.workers.dev/auth/callback"]
+redirect_urls = ["https://wsystem.dev/shopify/callback"]
 
 [webhooks]
 api_version = "2026-07"
