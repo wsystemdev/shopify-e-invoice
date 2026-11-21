@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import app, { generate } from "../src/index.js";
+import app, { generate, ensureWebhooks } from "../src/index.js";
 import { hmac, seal, unseal, verifySessionToken } from "../src/crypto.js";
 
 class KV { constructor() { this.m = new Map(); }
@@ -91,4 +91,23 @@ test("admin page needs a valid hmac", async () => {
   const e = env(); const q = `host=abc&shop=${SHOP}&timestamp=1`; const sig = await hmac("sec", q);
   assert.equal((await app.fetch(new Request(`https://app.example/app?${q}&hmac=${sig}`), e, ctx())).status, 200);
   assert.equal((await app.fetch(new Request(`https://app.example/app?${q}&hmac=bad`), e, ctx())).status, 400);
+});
+
+test("ensureWebhooks creates only missing subscriptions through GraphQL", async () => {
+  const e = env(); const sent = [];
+  const f = async (u, i) => { const b = JSON.parse(i.body); sent.push(b); if (b.query.startsWith("{")) return new Response(JSON.stringify({ data: { webhookSubscriptions: { nodes: [{ topic: "ORDERS_PAID", endpoint: { callbackUrl: "https://app.example/webhooks/orders-paid" } }] } } }));
+    return new Response(JSON.stringify({ data: { webhookSubscriptionCreate: { userErrors: [] } } })); };
+  const made = await ensureWebhooks(e, SHOP, "tok", f);
+  assert.deepEqual(made, ["ORDERS_CREATE", "APP_UNINSTALLED"]);
+  assert.equal(sent[1].variables.s.callbackUrl, "https://app.example/webhooks/orders-create");
+});
+test("other /shopify-* site pages pass through to the origin", async () => {
+  const orig = globalThis.fetch; let hit = "";
+  globalThis.fetch = async (r) => { hit = r.url; return new Response("site"); };
+  try { const r = await app.fetch(new Request("https://wsystem.dev/shopify-xrechnung"), env(), ctx()); assert.equal(await r.text(), "site"); assert.equal(hit, "https://wsystem.dev/shopify-xrechnung"); } finally { globalThis.fetch = orig; }
+});
+test("app page allows Shopify framing only", async () => {
+  const e = env(); const q = `host=abc&shop=${SHOP}`; const sig = await hmac("sec", q);
+  const r = await app.fetch(new Request(`https://wsystem.dev/shopify?${q}&hmac=${sig}`), e, ctx());
+  assert.equal(r.status, 200); assert.equal(r.headers.get("content-security-policy"), "frame-ancestors https://*.myshopify.com https://admin.shopify.com"); assert.equal(r.headers.get("x-frame-options"), null);
 });

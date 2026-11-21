@@ -60,6 +60,26 @@ async function exchangeToken(env, shop, idToken) {
   if (!r.ok) throw new Error(`token exchange ${r.status}`);
   return (await r.json()).access_token;
 }
+const WEBHOOKS = [["ORDERS_CREATE", "/webhooks/orders-create"], ["ORDERS_PAID", "/webhooks/orders-paid"], ["APP_UNINSTALLED", "/webhooks/app-uninstalled"]];
+// Register the order webhooks through the Admin GraphQL API (idempotent: lists existing subscriptions first).
+export async function ensureWebhooks(env, shop, token, f = fetch) {
+  const gql = async (query, variables) => {
+    const r = await f(`https://${shop}/admin/api/${env.SHOPIFY_API_VERSION}/graphql.json`, { method: "POST", headers: { "X-Shopify-Access-Token": token, "content-type": "application/json" }, body: JSON.stringify({ query, variables }) });
+    if (!r.ok) throw new Error(`graphql ${r.status}`);
+    return r.json();
+  };
+  const have = await gql("{ webhookSubscriptions(first: 50) { nodes { topic endpoint { __typename ... on WebhookHttpEndpoint { callbackUrl } } } } }");
+  const urls = new Set(((have.data && have.data.webhookSubscriptions.nodes) || []).map((n) => `${n.topic}|${n.endpoint && n.endpoint.callbackUrl}`));
+  const created = [];
+  for (const [topic, path] of WEBHOOKS) {
+    const callbackUrl = env.APP_URL + path;
+    if (urls.has(`${topic}|${callbackUrl}`)) continue;
+    const r = await gql("mutation($t: WebhookSubscriptionTopic!, $s: WebhookSubscriptionInput!) { webhookSubscriptionCreate(topic: $t, webhookSubscription: $s) { userErrors { message } } }", { t: topic, s: { callbackUrl, format: "JSON" } });
+    const errs = r.data && r.data.webhookSubscriptionCreate.userErrors;
+    if (!errs || !errs.length) created.push(topic);
+  }
+  return created;
+}
 const dlUrl = async (env, shop, id) => `${env.APP_URL}/d/${shop}/${id}?t=${(await hmac(env.ENC_KEY, `dl|${shop}|${id}`)).slice(0, 32)}`;
 
 // ---------- invoice lifecycle ----------
@@ -136,6 +156,9 @@ async function onCompliance(env, body) {
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
+    // Route pattern is wsystem.dev/shopify* (a bare pattern ignores URLs with a query string), so other pages that
+    // start with "shopify" (e.g. /shopify-xrechnung) are passed through to the site untouched.
+    if (/^\/shopify[^/]/.test(url.pathname)) return fetch(req);
     let path = url.pathname.replace(/^\/shopify(?=\/|$)/, "") || "/"; // served under wsystem.dev/shopify/*
     if (path === "/" && url.searchParams.get("shop")) path = "/app"; // Shopify opens the app URL itself
     try {
@@ -160,7 +183,7 @@ export default {
         const shop = (url.searchParams.get("shop") || "").toLowerCase();
         if (!SHOP_RE.test(shop) || !(await verifyQuery(env, url))) return new Response("Open this app from your Shopify admin.", { status: 400 });
         return new Response(adminPage({ apiKey: env.SHOPIFY_API_KEY, shop, host: url.searchParams.get("host"), locale: url.searchParams.get("locale") }), {
-          headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": `frame-ancestors https://${shop} https://admin.shopify.com`, "cache-control": "no-store" } });
+          headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": "frame-ancestors https://*.myshopify.com https://admin.shopify.com", "cache-control": "no-store" } });
       }
 
       if (path.startsWith("/d/")) {
@@ -182,6 +205,7 @@ export default {
           const token = await exchangeToken(env, shop, bearer);
           sd = { settings: sd ? sd.settings : { ...DEFAULT_SETTINGS }, token };
           await putShop(env, shop, sd);
+          try { await ensureWebhooks(env, shop, token); } catch (e) { /* retried on the next settings save */ }
         }
         if (path === "/api/settings" && req.method === "GET") {
           const s = { ...sd.settings }; if (s.api_key) s.api_key = "********";
@@ -197,7 +221,9 @@ export default {
           if (!["xrechnung", "en16931", "peppol-bis3"].includes(s.format)) s.format = "xrechnung";
           if (!["paid", "created", "off"].includes(s.trigger)) s.trigger = "paid";
           await putShop(env, shop, { token: sd.token, settings: s });
-          return json({ ok: true });
+          let webhooks = [];
+          try { webhooks = await ensureWebhooks(env, shop, sd.token); } catch (e) { /* best effort */ }
+          return json({ ok: true, webhooks });
         }
         if (path === "/api/invoices") {
           const l = await env.STORE.list({ prefix: `inv:${shop}:`, limit: 200 });
