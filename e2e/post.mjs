@@ -1,0 +1,10 @@
+import fs from "fs"; import { hmac } from "../src/crypto.js";
+const rd = (p) => Object.fromEntries(fs.readFileSync(p, "utf8").split("\n").filter((l) => l.includes("=") && !l.startsWith("#")).map((l) => { const i = l.indexOf("="); return [l.slice(0, i), l.slice(i + 1)]; }));
+const app = rd("/workspace/growth/secrets/shopify_app.env"); const TOKEN = fs.readFileSync("/workspace/growth/secrets/shopify_cc_token.txt", "utf8").trim();
+const ids = JSON.parse(fs.readFileSync("/workspace/growth/shopify_e2e_orders.json"));
+const id = Object.values(ids)[0].id;
+const o = await (await fetch(`https://${app.SHOPIFY_DEV_STORE}/admin/api/2026-07/orders/${id}.json`, { headers: { "X-Shopify-Access-Token": TOKEN } })).json();
+console.log(Object.keys(o.order).includes("billing_address"), o.order.billing_address && o.order.billing_address.company, JSON.stringify(o.order.line_items[0].tax_lines), o.order.financial_status);
+const raw = JSON.stringify(o.order);
+const r = await fetch("https://wsystem.dev/shopify/webhooks/orders-paid", { method: "POST", body: raw, headers: { "x-shopify-hmac-sha256": await hmac(app.SHOPIFY_CLIENT_SECRET, raw, "base64"), "x-shopify-shop-domain": app.SHOPIFY_DEV_STORE, "x-shopify-topic": "orders/paid" } });
+console.log("webhook post", r.status);

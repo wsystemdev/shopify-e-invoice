@@ -111,3 +111,40 @@ test("app page allows Shopify framing only", async () => {
   const r = await app.fetch(new Request(`https://wsystem.dev/shopify?${q}&hmac=${sig}`), e, ctx());
   assert.equal(r.status, 200); assert.equal(r.headers.get("content-security-policy"), "frame-ancestors https://*.myshopify.com https://admin.shopify.com"); assert.equal(r.headers.get("x-frame-options"), null);
 });
+
+import vm from "node:vm";
+import { adminPage } from "../src/admin.js";
+test("admin page: every fetch goes through /shopify, save shows success and error toasts, blank key not sent as wipe", async () => {
+  const html = adminPage({ apiKey: "cid", shop: SHOP, host: "h", locale: "en", base: "/shopify" });
+  const script = html.match(/<script>\n([\s\S]*?)<\/script>/)[1];
+  const urls = []; const toasts = []; let failNext = false;
+  const els = {}; const el = (id) => (els[id] ||= { style: {}, textContent: "", elements: { order: { value: "1001" } }, set onsubmit(f) { this._s = f; }, get onsubmit() { return this._s; } });
+  const form = { elements: {}, _s: null, set onsubmit(f) { this._s = f; }, get onsubmit() { return this._s; } };
+  const ctxv = { window: {}, URLSearchParams, JSON, Object, String, Promise, setTimeout, clearTimeout,
+    FormData: class { constructor() { return; } [Symbol.iterator]() { return [["api_key", ""], ["seller_name", "X"]][Symbol.iterator](); } },
+    document: { getElementById: (id) => (id === "f" ? form : el(id)) },
+    shopify: { idToken: async () => "tok", toast: { show: (m, o) => toasts.push([m, !!(o && o.isError)]) } },
+    fetch: async (u, o) => { urls.push(u); if (failNext) return { ok: false, status: 404, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => (String(u).includes("/api/settings") ? (o && o.method === "POST" ? { ok: true } : { settings: {} }) : { invoices: [] }) }; } };
+  vm.createContext(ctxv); vm.runInContext(script, ctxv); await new Promise((r) => setTimeout(r, 20));
+  await form.onsubmit({ preventDefault() {} }); await new Promise((r) => setTimeout(r, 20));
+  assert.ok(urls.length >= 3 && urls.every((u) => u.startsWith("/shopify/api/")), urls.join());
+  assert.deepEqual(toasts.at(-1), ["Saved.", false]);
+  failNext = true; await form.onsubmit({ preventDefault() {} }); await new Promise((r) => setTimeout(r, 20));
+  assert.equal(toasts.at(-1)[1], true); assert.match(toasts.at(-1)[0], /Could not save/);
+});
+test("blank or masked api_key in a save does not wipe the stored key", async () => {
+  const e = env(); await seedShop(e, { api_key: await seal(e.ENC_KEY, "realkey") });
+  const h = { authorization: "Bearer " + (await jwt(claims())) };
+  for (const v of ["", "********", "  "]) await app.fetch(new Request("https://wsystem.dev/shopify/api/settings", { method: "POST", headers: h, body: JSON.stringify({ api_key: v, seller_city: "Bonn" }) }), e, ctx());
+  const raw = JSON.parse(await e.STORE.get(`shop:${SHOP}`)); assert.equal(await unseal(e.ENC_KEY, raw.settings.api_key), "realkey"); assert.equal(raw.settings.seller_city, "Bonn");
+});
+
+test("settings still work when the token exchange fails", async () => {
+  const e = env(); const orig = globalThis.fetch; globalThis.fetch = async () => new Response("{}", { status: 400 });
+  try {
+    const h = { authorization: "Bearer " + (await jwt(claims())) };
+    const r = await app.fetch(new Request("https://wsystem.dev/shopify/api/settings", { method: "POST", headers: h, body: JSON.stringify({ seller_name: "Z GmbH" }) }), e, ctx());
+    assert.equal(r.status, 200); const g = await (await app.fetch(new Request("https://wsystem.dev/shopify/api/settings", { headers: h }), e, ctx())).json(); assert.equal(g.settings.seller_name, "Z GmbH");
+  } finally { globalThis.fetch = orig; }
+});

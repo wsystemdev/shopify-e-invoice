@@ -80,6 +80,14 @@ export async function ensureWebhooks(env, shop, token, f = fetch) {
   }
   return created;
 }
+// Fallback for shops owned by our own organisation (dev store): client credentials grant, 24 h token, never stored.
+async function clientCredentialsToken(env, shop) {
+  try {
+    const r = await fetch(`https://${shop}/admin/oauth/access_token`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ client_id: env.SHOPIFY_API_KEY, client_secret: env.SHOPIFY_API_SECRET, grant_type: "client_credentials" }) });
+    return r.ok ? (await r.json()).access_token || "" : "";
+  } catch (e) { return ""; }
+}
 const dlUrl = async (env, shop, id) => `${env.APP_URL}/d/${shop}/${id}?t=${(await hmac(env.ENC_KEY, `dl|${shop}|${id}`)).slice(0, 32)}`;
 
 // ---------- invoice lifecycle ----------
@@ -104,14 +112,15 @@ export async function generate(env, shop, order, shopData, { force = false, f = 
     rec = { order: orderNumber(order), number: body.invoice_number, format: body.format, valid: p.valid, xml: p.valid ? p.xml : "", errors: p.errors, mismatch: p.mismatch, created: new Date().toISOString() };
   }
   await env.STORE.put(key, JSON.stringify(rec), { expirationTtl: TTL, metadata: { order: rec.order, number: rec.number, valid: rec.valid, created: rec.created } });
-  // tag + metafield on the order (needs the access token)
-  if (shopData.token) {
+  // tag + metafield on the order (needs an access token)
+  const tagToken = shopData.token || (f === fetch ? await clientCredentialsToken(env, shop) : "");
+  if (tagToken) {
     try {
       const tags = String(order.tags || "").split(",").map((x) => x.trim()).filter((x) => x && !/^e-invoice-/.test(x));
       tags.push(rec.valid ? "e-invoice-valid" : "e-invoice-failed");
       const o = { id: order.id, tags: tags.join(", ") };
       if (rec.valid) o.metafields = [{ namespace: "wsystem", key: "einvoice_url", type: "url", value: await dlUrl(env, shop, order.id) }];
-      await shopifyFetch(env, shop, shopData.token, `/orders/${order.id}.json`, { method: "PUT", body: JSON.stringify({ order: o }) });
+      await shopifyFetch(env, shop, tagToken, `/orders/${order.id}.json`, { method: "PUT", body: JSON.stringify({ order: o }) });
     } catch (e) { /* tagging is best effort */ }
   }
   if (rec.valid && s.email_copy === "yes" && env.EMAIL_COPY_ENABLED === "1" && env.RESEND_API_KEY && s.seller_email) {
@@ -182,7 +191,7 @@ export default {
       if (path === "/app" || path === "/app/") {
         const shop = (url.searchParams.get("shop") || "").toLowerCase();
         if (!SHOP_RE.test(shop) || !(await verifyQuery(env, url))) return new Response("Open this app from your Shopify admin.", { status: 400 });
-        return new Response(adminPage({ apiKey: env.SHOPIFY_API_KEY, shop, host: url.searchParams.get("host"), locale: url.searchParams.get("locale") }), {
+        return new Response(adminPage({ apiKey: env.SHOPIFY_API_KEY, shop, host: url.searchParams.get("host"), locale: url.searchParams.get("locale"), base: "/shopify" }), {
           headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": "frame-ancestors https://*.myshopify.com https://admin.shopify.com", "cache-control": "no-store" } });
       }
 
@@ -201,11 +210,15 @@ export default {
         if (!sess) return json({ error: "unauthorized" }, 401);
         const shop = sess.shop;
         let sd = await getShop(env, shop);
+        let tokenError = "";
         if (!sd || !sd.token) {
-          const token = await exchangeToken(env, shop, bearer);
-          sd = { settings: sd ? sd.settings : { ...DEFAULT_SETTINGS }, token };
-          await putShop(env, shop, sd);
-          try { await ensureWebhooks(env, shop, token); } catch (e) { /* retried on the next settings save */ }
+          // The session token already proves the request comes from the shop's admin; the access token is only needed to call Shopify.
+          sd = { settings: sd ? sd.settings : { ...DEFAULT_SETTINGS }, token: "" };
+          try {
+            sd.token = await exchangeToken(env, shop, bearer);
+            await putShop(env, shop, sd);
+            try { await ensureWebhooks(env, shop, sd.token); } catch (e) { /* retried on the next settings save */ }
+          } catch (e) { tokenError = String(e.message || e).slice(0, 80); if (!(await env.STORE.get(`shop:${shop}`))) await putShop(env, shop, sd); }
         }
         if (path === "/api/settings" && req.method === "GET") {
           const s = { ...sd.settings }; if (s.api_key) s.api_key = "********";
@@ -215,7 +228,7 @@ export default {
           const d = await req.json(); const s = { ...sd.settings };
           for (const k of Object.keys(DEFAULT_SETTINGS)) {
             if (typeof d[k] !== "string") continue;
-            if (k === "api_key" && d[k] === "********") continue;
+            if (k === "api_key" && (d[k] === "********" || d[k].trim() === "")) continue; // never wipe a stored key with a blank field
             s[k] = d[k].trim().slice(0, 300);
           }
           if (!["xrechnung", "en16931", "peppol-bis3"].includes(s.format)) s.format = "xrechnung";
@@ -238,6 +251,7 @@ export default {
         if (path === "/api/create" && req.method === "POST") {
           const { order: name } = await req.json();
           const q = encodeURIComponent("#" + String(name).replace(/^#/, ""));
+          if (!sd.token) return json({ ok: false, error: `No Shopify access token yet (${tokenError || "reopen the app"})` });
           const o = await shopifyFetch(env, shop, sd.token, `/orders.json?name=${q}&status=any&limit=1`);
           const order = (o.orders || [])[0];
           if (!order) return json({ ok: false, error: "Order not found" });

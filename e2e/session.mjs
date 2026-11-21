@@ -1,0 +1,15 @@
+import fs from "fs"; import { hmac } from "../src/crypto.js";
+const rd = (p) => Object.fromEntries(fs.readFileSync(p, "utf8").split("\n").filter((l) => l.includes("=") && !l.startsWith("#")).map((l) => { const i = l.indexOf("="); return [l.slice(0, i), l.slice(i + 1)]; }));
+const app = rd("/workspace/growth/secrets/shopify_app.env");
+const b = (s) => Buffer.from(s).toString("base64url"); const now = Math.floor(Date.now() / 1000);
+const h = b(JSON.stringify({ alg: "HS256", typ: "JWT" })), p = b(JSON.stringify({ iss: `https://${app.SHOPIFY_DEV_STORE}/admin`, dest: `https://${app.SHOPIFY_DEV_STORE}/admin`.replace("/admin", "") + "/admin", aud: app.SHOPIFY_CLIENT_ID, sub: "1", exp: now + 60, nbf: now - 5, iat: now, jti: crypto.randomUUID(), sid: "x" }));
+const tok = `${h}.${p}.${Buffer.from(await hmac(app.SHOPIFY_CLIENT_SECRET, h + "." + p, "base64"), "base64").toString("base64url")}`;
+const H = { authorization: "Bearer " + tok, "content-type": "application/json" };
+const g = await fetch("https://wsystem.dev/shopify/api/settings", { headers: H }); const gj = await g.json();
+console.log("GET /shopify/api/settings", g.status, gj.error || `seller=${gj.settings && gj.settings.seller_name} api_key=${gj.settings && gj.settings.api_key} trigger=${gj.settings && gj.settings.trigger}`);
+const p1 = await fetch("https://wsystem.dev/shopify/api/settings", { method: "POST", headers: H, body: JSON.stringify({ api_key: "", seller_city: "Berlin" }) }); console.log("POST blank key", p1.status, JSON.stringify(await p1.json()));
+const g2 = await (await fetch("https://wsystem.dev/shopify/api/settings", { headers: H })).json(); console.log("key still stored:", g2.settings && g2.settings.api_key);
+const bad = await fetch("https://wsystem.dev/api/settings", { headers: H }); console.log("old unprefixed path", bad.status);
+const l = await (await fetch("https://wsystem.dev/shopify/api/invoices", { headers: H })).json(); console.log("invoices listed:", (l.invoices || []).map((i) => `${i.order}:${i.valid}`).join(","));
+const ex = await fetch(`https://${app.SHOPIFY_DEV_STORE}/admin/oauth/access_token`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify({ client_id: app.SHOPIFY_CLIENT_ID, client_secret: app.SHOPIFY_CLIENT_SECRET, grant_type: "urn:ietf:params:oauth:grant-type:token-exchange", subject_token: tok, subject_token_type: "urn:ietf:params:oauth:token-type:id_token", requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token" }) });
+const t = await ex.text(); console.log("direct exchange", ex.status, t.replace(/shp[a-z]{2}_[a-z0-9]+/g, "<tok>").slice(0, 300));
