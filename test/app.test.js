@@ -152,3 +152,43 @@ test("settings still work when the token exchange fails", async () => {
     assert.equal(r.status, 200); const g = await (await app.fetch(new Request("https://wsystem.dev/shopify/api/settings", { headers: h }), e, ctx())).json(); assert.equal(g.settings.seller_name, "Z GmbH");
   } finally { globalThis.fetch = orig; }
 });
+
+import { ensureAccess } from "../src/index.js";
+const tokRes = (o) => new Response(JSON.stringify({ access_token: "shpat_new", expires_in: 3600, refresh_token: "shprt_new", refresh_token_expires_in: 7776000, ...o }));
+test("token exchange asks for an expiring offline token and stores refresh token + expiry", async () => {
+  const e = env(); const orig = globalThis.fetch; let body;
+  globalThis.fetch = async (u, i) => { if (String(u).includes("oauth/access_token")) { body = JSON.parse(i.body); return tokRes(); } return new Response(JSON.stringify({ data: { webhookSubscriptions: { nodes: [] }, webhookSubscriptionCreate: { userErrors: [] } } })); };
+  try {
+    const sd = { settings: {}, token: "", refresh: "", exp: 0, rexp: 0 };
+    assert.equal(await ensureAccess(e, SHOP, sd, "idtok"), "");
+    assert.equal(body.expiring, 1); assert.equal(sd.token, "shpat_new"); assert.equal(sd.refresh, "shprt_new"); assert.ok(sd.exp > Date.now() / 1000);
+    const stored = await e.STORE.get(`shop:${SHOP}`); assert.ok(!stored.includes("shpat_new") && !stored.includes("shprt_new"));
+  } finally { globalThis.fetch = orig; }
+});
+test("expired access token is refreshed with the refresh token (webhook path, no session)", async () => {
+  const e = env(); const orig = globalThis.fetch; let body;
+  globalThis.fetch = async (u, i) => { if (String(u).includes("oauth/access_token")) { body = JSON.parse(i.body); return tokRes({ access_token: "shpat_r2" }); } return new Response(JSON.stringify({ data: { webhookSubscriptions: { nodes: [] }, webhookSubscriptionCreate: { userErrors: [] } } })); };
+  try {
+    const now = Math.floor(Date.now() / 1000); const sd = { settings: {}, token: "old", refresh: "shprt_old", exp: now - 10, rexp: now + 1000 };
+    assert.equal(await ensureAccess(e, SHOP, sd), ""); assert.equal(body.grant_type, "refresh_token"); assert.equal(body.refresh_token, "shprt_old"); assert.equal(sd.token, "shpat_r2");
+    const fresh = { settings: {}, token: "ok", refresh: "r", exp: now + 3000, rexp: now + 1000 }; body = null; await ensureAccess(e, SHOP, fresh); assert.equal(body, null); // still valid: no request
+  } finally { globalThis.fetch = orig; }
+});
+test("/api/create: reason codes, regenerates an existing invoice, no 500", async () => {
+  const e = env(); const now = Math.floor(Date.now() / 1000);
+  await e.STORE.put(`shop:${SHOP}`, JSON.stringify({ token: await seal(e.ENC_KEY, "shpat_x"), refresh: "", exp: now + 3000, rexp: 0, settings: { seller_name: "M GmbH" } }));
+  const h = { authorization: "Bearer " + (await jwt(claims())), "content-type": "application/json" };
+  const call = async (order) => (await app.fetch(new Request("https://wsystem.dev/shopify/api/create", { method: "POST", headers: h, body: JSON.stringify({ order }) }), e, ctx())).json();
+  const orig = globalThis.fetch; let shopifyStatus = 200;
+  globalThis.fetch = async (u) => { u = String(u);
+    if (u.includes("/orders.json")) return shopifyStatus !== 200 ? new Response("{}", { status: shopifyStatus }) : new Response(JSON.stringify({ orders: u.includes("%231002") ? [ORDER] : [] }));
+    if (u.includes("api.wsystem") || u.includes("api.test")) return new Response(JSON.stringify({ valid: true, xml: "<I/>", errors: [] }));
+    return new Response("{}"); };
+  try {
+    assert.equal((await call("abc")).reason, "bad_order");
+    assert.equal((await call("9999")).reason, "order_not_found");
+    const first = await call("#1002"); assert.equal(first.ok, true); assert.equal(first.regenerated, false);
+    const again = await call("1002"); assert.equal(again.ok, true); assert.equal(again.regenerated, true);
+    shopifyStatus = 403; const bad = await call("1002"); assert.equal(bad.reason, "shopify_error"); assert.match(bad.error, /403/);
+  } finally { globalThis.fetch = orig; }
+});
