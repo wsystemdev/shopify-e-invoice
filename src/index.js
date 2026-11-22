@@ -125,6 +125,16 @@ export async function ensureWebhooks(env, shop, token, f = fetch) {
   }
   return created;
 }
+// Test charges only for development / partner-test stores (shop.plan.partnerDevelopment) or an allowlist (env TEST_SHOPS, comma list;
+// default: our dev store), or BILLING_TEST=1. Everything else (production shops) is billed for real.
+export async function isTestShop(env, shop, token, f = fetch) {
+  if (env.BILLING_TEST === "1") return true;
+  if ((env.TEST_SHOPS == null ? "wsystem-einvoice-dev.myshopify.com" : env.TEST_SHOPS).split(",").map((x) => x.trim().toLowerCase()).includes(shop)) return true;
+  try {
+    const r = await f(`https://${shop}/admin/api/${env.SHOPIFY_API_VERSION}/graphql.json`, { method: "POST", headers: { "X-Shopify-Access-Token": token, "content-type": "application/json" }, body: JSON.stringify({ query: "{ shop { plan { partnerDevelopment } } }" }) });
+    const d = await r.json(); return !!(d.data && d.data.shop && d.data.shop.plan && d.data.shop.plan.partnerDevelopment === true);
+  } catch (e) { return false; }
+}
 // Billing -> W System key. Reads the shop's ACTIVE app subscriptions from Shopify (source of truth), maps the highest one to a W System
 // shop plan (none = shop_free) and asks the W System API to create or change this shop's key. The key lands in the shop settings
 // (api_key, flagged api_key_managed) so the merchant never copies a key. A key the merchant typed in is kept unless they subscribe.
@@ -345,7 +355,7 @@ export default {
           const handle = shop.replace(/\.myshopify\.com$/, "");
           const r = await fetch(`https://${shop}/admin/api/${env.SHOPIFY_API_VERSION}/graphql.json`, { method: "POST", headers: { "X-Shopify-Access-Token": sd.token, "content-type": "application/json" },
             body: JSON.stringify({ query: "mutation($name:String!,$url:URL!,$test:Boolean,$lines:[AppSubscriptionLineItemInput!]!){ appSubscriptionCreate(name:$name,returnUrl:$url,test:$test,lineItems:$lines){ confirmationUrl userErrors{message} } }",
-              variables: { name: pl.name, url: `https://admin.shopify.com/store/${handle}/apps/${env.SHOPIFY_API_KEY}`, test: env.BILLING_TEST === "1", lines: [{ plan: { appRecurringPricingDetails: { price: { amount: pl.price, currencyCode: pl.currency || "USD" }, interval: pl.interval || "EVERY_30_DAYS" } } }] } }) });
+              variables: { name: pl.name, url: `https://admin.shopify.com/store/${handle}/apps/${env.SHOPIFY_API_KEY}`, test: await isTestShop(env, shop, sd.token), lines: [{ plan: { appRecurringPricingDetails: { price: { amount: pl.price, currencyCode: pl.currency || "USD" }, interval: pl.interval || "EVERY_30_DAYS" } } }] } }) });
           const d = await r.json().catch(() => ({})); const c = d.data && d.data.appSubscriptionCreate;
           if (!c || !c.confirmationUrl) return json({ ok: false, reason: "billing_error", error: (c && c.userErrors && c.userErrors[0] && c.userErrors[0].message) || "Shopify did not create the subscription." });
           return json({ ok: true, confirmationUrl: c.confirmationUrl });

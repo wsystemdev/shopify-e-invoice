@@ -249,3 +249,15 @@ test("billing sync: free key on install, upgrade on active subscription, downgra
   assert.equal((await syncBilling(env(), SHOP, { token: "x", settings: {} }, { f })).reason, "provisioning_off");
 });
 async function getSd(e) { const sd = JSON.parse(await e.STORE.get(`shop:${SHOP}`)); sd.token = "shpat_x"; return sd; }
+
+test("isTestShop: allowlist and partnerDevelopment are test; production shop is real", async () => {
+  const { isTestShop } = await import("../src/index.js");
+  const mk = (pd) => async () => new Response(JSON.stringify({ data: { shop: { plan: { partnerDevelopment: pd } } } }));
+  const e = { SHOPIFY_API_VERSION: "2026-07" };
+  assert.equal(await isTestShop(e, "wsystem-einvoice-dev.myshopify.com", "t", mk(false)), true);
+  assert.equal(await isTestShop(e, "other-dev.myshopify.com", "t", mk(true)), true);
+  assert.equal(await isTestShop(e, "real-shop.myshopify.com", "t", mk(false)), false);
+  assert.equal(await isTestShop(e, "real-shop.myshopify.com", "t", async () => { throw new Error("x"); }), false);
+  assert.equal(await isTestShop({ ...e, TEST_SHOPS: "" }, "wsystem-einvoice-dev.myshopify.com", "t", mk(false)), false);
+  assert.equal(await isTestShop({ ...e, BILLING_TEST: "1" }, "real-shop.myshopify.com", "t", mk(false)), true);
+});
