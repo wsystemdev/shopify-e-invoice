@@ -271,3 +271,27 @@ test("nightly backup: sealed per-shop bundle in the backup store, restorable, de
   await wh(e, "/webhooks/compliance", { shop_domain: SHOP }, "shop/redact");
   assert.equal(await e.BACKUP.get(k), null); assert.ok(await e.BACKUP.get(`bk:other.myshopify.com:${new Date().toISOString().slice(0, 10)}`));
 });
+
+test("failed regeneration keeps the earlier valid invoice and tag, stores lastError, shows notice data", async () => {
+  const e = env(); await seedShop(e); const orig = globalThis.fetch; const gql = [];
+  globalThis.fetch = async (u, i) => { if (String(u).includes("graphql.json")) { gql.push(i.body); return new Response(JSON.stringify({ data: {} })); } return new Response("{}"); };
+  const ok = async () => new Response(JSON.stringify({ valid: true, xml: "<Invoice/>", errors: [], totals: { total_with_vat: 119 } }));
+  const quota = async () => new Response(JSON.stringify({ error: "monthly_quota_exhausted" }), { status: 429 });
+  try {
+    const sd = { settings: { seller_name: "M GmbH", api_key: "k" }, token: "shpat_x" };
+    await generate(e, SHOP, ORDER, sd, { force: true, f: ok });
+    const tagCalls = gql.length;
+    const r = await generate(e, SHOP, ORDER, sd, { force: true, f: quota });
+    assert.equal(r.valid, true); assert.equal(r.xml, "<Invoice/>"); assert.match(r.lastError.message, /quota/); assert.ok(r.lastAttemptAt);
+    const rec = await e.STORE.get(`inv:${SHOP}:77`, "json"); assert.equal(rec.valid, true); assert.equal(rec.xml, "<Invoice/>"); assert.match(rec.lastError.message, /quota/);
+    assert.equal(gql.length, tagCalls); assert.ok(!gql.some((b) => b.includes("e-invoice-failed")));
+    const idx = await e.STORE.get(`idx:${SHOP}`, "json"); assert.equal(idx[0].valid, true); assert.ok(idx[0].lastError);
+    const h = { authorization: "Bearer " + (await jwt(claims())) };
+    const list = await (await app.fetch(new Request("https://wsystem.dev/shopify/api/invoices", { headers: h }), e, ctx())).json(); assert.ok(list.invoices[0].lastError); assert.equal(list.invoices[0].valid, true);
+    await generate(e, SHOP, ORDER, sd, { force: true, f: ok });
+    const clean = await e.STORE.get(`inv:${SHOP}:77`, "json"); assert.equal(clean.lastError, undefined);
+    // no earlier valid invoice: the failure is still recorded as a failed invoice and tagged
+    await e.STORE.delete(`inv:${SHOP}:77`);
+    const f = await generate(e, SHOP, ORDER, sd, { force: true, f: quota }); assert.equal(f.valid, false); assert.ok(gql.some((b) => b.includes("e-invoice-failed")));
+  } finally { globalThis.fetch = orig; }
+});

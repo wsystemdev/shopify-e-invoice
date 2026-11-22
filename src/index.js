@@ -245,12 +245,21 @@ export async function generate(env, shop, order, shopData, { force = false, f = 
     const p = parseResult(data, order.current_total_price ?? order.total_price);
     rec = { order: orderNumber(order), number: body.invoice_number, format: body.format, valid: p.valid, xml: p.valid ? p.xml : "", errors: p.errors, mismatch: p.mismatch, created: new Date().toISOString() };
   }
+  // A failed attempt never replaces an earlier valid invoice (or its tag): the failure is stored next to it.
+  let kept = false;
+  if (!rec.valid) {
+    const prev = await env.STORE.get(key, "json");
+    if (prev && prev.valid && prev.xml) {
+      const err = (rec.errors && rec.errors[0]) || { rule_id: "API", message: "failed" };
+      rec = { ...prev, lastError: { rule_id: err.rule_id, message: String(err.message || "").slice(0, 300), fix: err.fix || "" }, lastAttemptAt: new Date().toISOString() }; kept = true;
+    }
+  }
   await env.STORE.put(key, JSON.stringify(rec), { expirationTtl: TTL, metadata: { order: rec.order, number: rec.number, valid: rec.valid, created: rec.created } });
-  await idxUpdate(env, shop, order.id, { order: rec.order, number: rec.number, valid: rec.valid, created: rec.created, xml: !!rec.xml, errors: (rec.errors || []).slice(0, 2) });
+  await idxUpdate(env, shop, order.id, { order: rec.order, number: rec.number, valid: rec.valid, created: rec.created, xml: !!rec.xml, errors: (rec.errors || []).slice(0, 2), ...(kept ? { lastError: rec.lastError, lastAttemptAt: rec.lastAttemptAt } : {}) });
   await audit(env, shop, "generate", order.id);
   // tag + metafield on the order (needs an access token)
   const tagToken = shopData.token;
-  if (tagToken) {
+  if (tagToken && !kept) {
     try {
       const tags = String(order.tags || "").split(",").map((x) => x.trim()).filter((x) => x && !/^e-invoice-/.test(x));
       tags.push(rec.valid ? "e-invoice-valid" : "e-invoice-failed");
@@ -387,7 +396,7 @@ export default {
             idx.sort((a, b) => String(b.created).localeCompare(String(a.created))); idx = idx.slice(0, 50);
             await env.STORE.put(`idx:${shop}`, JSON.stringify(idx), { expirationTtl: TTL });
           }
-          const invoices = await Promise.all(idx.slice(0, 25).map(async (i) => ({ order: i.order, number: i.number, valid: i.valid, created: i.created, xml: i.xml, errors: i.errors || [], url: await dlUrl(env, shop, i.id) })));
+          const invoices = await Promise.all(idx.slice(0, 25).map(async (i) => ({ order: i.order, number: i.number, valid: i.valid, created: i.created, xml: i.xml, errors: i.errors || [], lastError: i.lastError || null, lastAttemptAt: i.lastAttemptAt || null, url: await dlUrl(env, shop, i.id) })));
           await audit(env, shop, "list", "");
           return new Response(JSON.stringify({ invoices }), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
         }
@@ -419,7 +428,7 @@ export default {
           await audit(env, shop, "manual-create", order.id);
           let rec;
           try { rec = await generate(env, shop, order, { ...sd, token }, { force: true }); } catch (e) { return fail("generate_error", "Could not create the e-invoice.", 200, String(e.message).slice(0, 200)); }
-          return json({ ok: true, valid: rec.valid, regenerated: !!existing, errors: rec.errors || [] });
+          return json({ ok: true, valid: rec.valid, regenerated: !!existing, errors: rec.errors || [], ...(rec.lastError ? { kept_previous: true, lastError: rec.lastError } : {}) });
         }
         return json({ error: "not found" }, 404);
       }
