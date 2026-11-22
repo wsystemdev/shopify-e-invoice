@@ -149,14 +149,14 @@ export async function syncBilling(env, shop, sd, { f = fetch } = {}) {
     if (!d.data || !d.data.currentAppInstallation) return { ok: false, reason: "shopify_error" };
     subs = d.data.currentAppInstallation.activeSubscriptions || [];
   } catch (e) { return { ok: false, reason: "shopify_error" }; }
-  const plans = plansOf(env); let ws = "shop_free", subId = "";
+  const plans = plansOf(env); let ws = "shop_free", subId = "", cur = null;
   for (const sub of subs) {
     if (sub.status && sub.status !== "ACTIVE") continue;
     const pl = plans.find((x) => x.name === sub.name);
-    if (pl && (RANK[pl.ws] || 0) >= (RANK[ws] || 0) && pl.ws) { ws = pl.ws; subId = sub.id; }
+    if (pl && (RANK[pl.ws] || 0) >= (RANK[ws] || 0) && pl.ws) { ws = pl.ws; subId = sub.id; cur = pl; }
   }
   const s = sd.settings; const paid = ws !== "shop_free";
-  if (!paid && s.api_key && !s.api_key_managed) return { ok: true, plan: "own_key", paid: false }; // merchant uses their own key: nothing to provision
+  if (!paid && s.api_key && !s.api_key_managed) return { ok: true, plan: "own_key", paid: false, current: { id: "own_key", name: "Own W System key", invoices: null } }; // merchant uses their own key: nothing to provision
   const call = (rotate) => f(`${env.API_BASE || "https://api.wsystem.dev"}/billing/shopify/provision`, { method: "POST", headers: { "content-type": "application/json", "x-provision-secret": env.WSYSTEM_PROVISION_SECRET, "user-agent": "w-system-e-invoice-shopify/1.0" },
     body: JSON.stringify({ shop, plan: ws, subscription_id: subId, rotate }) });
   let r;
@@ -168,7 +168,7 @@ export async function syncBilling(env, shop, sd, { f = fetch } = {}) {
     if (!r.ok || !j.ok) return { ok: false, reason: "provision_failed", status: r.status };
   }
   if (j.api_key && (paid || !s.api_key || s.api_key_managed)) { s.api_key = j.api_key; s.api_key_managed = "1"; await putShop(env, shop, { ...sd, settings: s }); }
-  return { ok: true, plan: ws, paid, quota: j.quota };
+  return { ok: true, plan: ws, paid, quota: j.quota, current: cur ? { id: cur.id, ws: cur.ws, name: cur.name.replace(/^W System /, ""), invoices: cur.invoices, interval: cur.interval } : { id: "shop_free", ws: "shop_free", name: "Free", invoices: 25, interval: "" } };
 }
 const dlUrl = async (env, shop, id) => `${env.APP_URL}/d/${shop}/${id}?t=${(await hmac(env.ENC_KEY, `dl|${shop}|${id}`)).slice(0, 32)}`;
 

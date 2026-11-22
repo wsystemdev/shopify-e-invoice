@@ -240,7 +240,7 @@ test("billing sync: free key on install, upgrade on active subscription, downgra
   let r = await syncBilling(e, SHOP, await getSd(e), { f }); assert.equal(r.plan, "shop_free");
   assert.equal(calls[0].plan, "shop_free"); assert.equal(await unseal(e.ENC_KEY, (await sd0()).settings.api_key), "wsk_live_shop_free");
   active = [{ id: "gid://1", name: "W System Shop Plus", status: "ACTIVE" }];
-  r = await syncBilling(e, SHOP, await getSd(e), { f }); assert.equal(r.plan, "shop_plus"); assert.equal(calls.at(-1).subscription_id, "gid://1");
+  r = await syncBilling(e, SHOP, await getSd(e), { f }); assert.equal(r.plan, "shop_plus"); assert.equal(calls.at(-1).subscription_id, "gid://1"); assert.equal(r.current.name, "Shop Plus"); assert.equal(r.current.invoices, 750);
   active = []; r = await syncBilling(e, SHOP, await getSd(e), { f }); assert.equal(r.plan, "shop_free");
   // merchant with an own key and no subscription: nothing provisioned
   const e2 = env(); e2.WSYSTEM_PROVISION_SECRET = "p".repeat(32); await seedShop(e2, { api_key: "own" }); calls.length = 0;
