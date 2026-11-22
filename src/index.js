@@ -5,8 +5,19 @@ import { adminPage } from "./admin.js";
 const SHOP_RE = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
 const TTL = 60 * 60 * 24 * 400; // invoices expire after about 13 months
 const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
-// Billing: NO plan is live. Plans come from env BILLING_PLANS (JSON array of {id,name,price,currency}); empty = free to install.
-function plansOf(env) { try { const p = JSON.parse(env.BILLING_PLANS || "[]"); return Array.isArray(p) ? p : []; } catch (e) { return []; } }
+// Billing (approved 2026-11-22, same prices as everywhere; Shopify bills in USD): Free 25 invoices a month (no charge, key provisioned
+// automatically), Shop $13 / 150, Shop Plus $32 / 750, Shop Pro $65 / 2,000; annual = pay 10 months, get 12. `ws` = W System plan id
+// (quota in units on the shop's own key). BILLING_PLANS (JSON array) overrides this list; an empty array "[]" turns paid plans off.
+export const DEFAULT_PLANS = [
+  { id: "shop", ws: "shop", name: "W System Shop", invoices: 150, price: "13.00", currency: "USD", interval: "EVERY_30_DAYS" },
+  { id: "shop_plus", ws: "shop_plus", name: "W System Shop Plus", invoices: 750, price: "32.00", currency: "USD", interval: "EVERY_30_DAYS" },
+  { id: "shop_pro", ws: "shop_pro", name: "W System Shop Pro", invoices: 2000, price: "65.00", currency: "USD", interval: "EVERY_30_DAYS" },
+  { id: "shop_annual", ws: "shop", name: "W System Shop (annual)", invoices: 150, price: "130.00", currency: "USD", interval: "ANNUAL" },
+  { id: "shop_plus_annual", ws: "shop_plus", name: "W System Shop Plus (annual)", invoices: 750, price: "320.00", currency: "USD", interval: "ANNUAL" },
+  { id: "shop_pro_annual", ws: "shop_pro", name: "W System Shop Pro (annual)", invoices: 2000, price: "650.00", currency: "USD", interval: "ANNUAL" },
+];
+const RANK = { shop_free: 0, shop: 1, shop_plus: 2, shop_pro: 3 };
+function plansOf(env) { if (env.BILLING_PLANS == null || env.BILLING_PLANS === "") return DEFAULT_PLANS; try { const p = JSON.parse(env.BILLING_PLANS); return Array.isArray(p) ? p : []; } catch (e) { return []; } }
 const SECRET_FIELD = "api_key";
 
 // ---------- storage ----------
@@ -94,7 +105,7 @@ export async function ensureAccess(env, shop, sd, idToken) {
   }
   return err;
 }
-const WEBHOOKS = [["ORDERS_CREATE", "/webhooks/orders-create"], ["ORDERS_PAID", "/webhooks/orders-paid"], ["APP_UNINSTALLED", "/webhooks/app-uninstalled"]];
+const WEBHOOKS = [["ORDERS_CREATE", "/webhooks/orders-create"], ["ORDERS_PAID", "/webhooks/orders-paid"], ["APP_UNINSTALLED", "/webhooks/app-uninstalled"], ["APP_SUBSCRIPTIONS_UPDATE", "/webhooks/app-subscriptions"]];
 // Register the order webhooks through the Admin GraphQL API (idempotent: lists existing subscriptions first).
 export async function ensureWebhooks(env, shop, token, f = fetch) {
   const gql = async (query, variables) => {
@@ -113,6 +124,41 @@ export async function ensureWebhooks(env, shop, token, f = fetch) {
     if (!errs || !errs.length) created.push(topic);
   }
   return created;
+}
+// Billing -> W System key. Reads the shop's ACTIVE app subscriptions from Shopify (source of truth), maps the highest one to a W System
+// shop plan (none = shop_free) and asks the W System API to create or change this shop's key. The key lands in the shop settings
+// (api_key, flagged api_key_managed) so the merchant never copies a key. A key the merchant typed in is kept unless they subscribe.
+export async function syncBilling(env, shop, sd, { f = fetch } = {}) {
+  if (!env.WSYSTEM_PROVISION_SECRET) return { ok: false, reason: "provisioning_off" };
+  if (!sd.token) return { ok: false, reason: "no_access_token" };
+  let subs = [];
+  try {
+    const r = await f(`https://${shop}/admin/api/${env.SHOPIFY_API_VERSION}/graphql.json`, { method: "POST", headers: { "X-Shopify-Access-Token": sd.token, "content-type": "application/json" },
+      body: JSON.stringify({ query: "{ currentAppInstallation { activeSubscriptions { id name status } } }" }) });
+    const d = await r.json();
+    if (!d.data || !d.data.currentAppInstallation) return { ok: false, reason: "shopify_error" };
+    subs = d.data.currentAppInstallation.activeSubscriptions || [];
+  } catch (e) { return { ok: false, reason: "shopify_error" }; }
+  const plans = plansOf(env); let ws = "shop_free", subId = "";
+  for (const sub of subs) {
+    if (sub.status && sub.status !== "ACTIVE") continue;
+    const pl = plans.find((x) => x.name === sub.name);
+    if (pl && (RANK[pl.ws] || 0) >= (RANK[ws] || 0) && pl.ws) { ws = pl.ws; subId = sub.id; }
+  }
+  const s = sd.settings; const paid = ws !== "shop_free";
+  if (!paid && s.api_key && !s.api_key_managed) return { ok: true, plan: "own_key", paid: false }; // merchant uses their own key: nothing to provision
+  const call = (rotate) => f(`${env.API_BASE || "https://api.wsystem.dev"}/billing/shopify/provision`, { method: "POST", headers: { "content-type": "application/json", "x-provision-secret": env.WSYSTEM_PROVISION_SECRET, "user-agent": "w-system-e-invoice-shopify/1.0" },
+    body: JSON.stringify({ shop, plan: ws, subscription_id: subId, rotate }) });
+  let r;
+  try { r = await call(false); } catch (e) { return { ok: false, reason: "api_unreachable" }; }
+  let j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.ok) return { ok: false, reason: "provision_failed", status: r.status };
+  if (j.existing && !s.api_key_managed) { // the key exists on our side but this shop has no copy of it: rotate to get a fresh one
+    try { r = await call(true); j = await r.json().catch(() => ({})); } catch (e) { return { ok: false, reason: "api_unreachable" }; }
+    if (!r.ok || !j.ok) return { ok: false, reason: "provision_failed", status: r.status };
+  }
+  if (j.api_key && (paid || !s.api_key || s.api_key_managed)) { s.api_key = j.api_key; s.api_key_managed = "1"; await putShop(env, shop, { ...sd, settings: s }); }
+  return { ok: true, plan: ws, paid, quota: j.quota };
 }
 const dlUrl = async (env, shop, id) => `${env.APP_URL}/d/${shop}/${id}?t=${(await hmac(env.ENC_KEY, `dl|${shop}|${id}`)).slice(0, 32)}`;
 
@@ -213,9 +259,12 @@ export default {
         const topicHdr = (req.headers.get("x-shopify-topic") || "").toLowerCase();
         if (path === "/webhooks/orders-create") ctx.waitUntil(onOrderWebhook(env, req, body, "create"));
         else if (path === "/webhooks/orders-paid") ctx.waitUntil(onOrderWebhook(env, req, body, "paid"));
-        else if (path === "/webhooks/app-uninstalled") {
+        else if (path === "/webhooks/app-subscriptions") {
           const shop = (req.headers.get("x-shopify-shop-domain") || "").toLowerCase();
-          if (SHOP_RE.test(shop)) { const sd = await getShop(env, shop); if (sd) await putShop(env, shop, { settings: sd.settings }); }
+          if (SHOP_RE.test(shop)) ctx.waitUntil((async () => { const sd = await getShop(env, shop); if (sd) { await ensureAccess(env, shop, sd); await syncBilling(env, shop, (await getShop(env, shop)) || sd); } })());
+        } else if (path === "/webhooks/app-uninstalled") {
+          const shop = (req.headers.get("x-shopify-shop-domain") || "").toLowerCase();
+          if (SHOP_RE.test(shop)) { const sd = await getShop(env, shop); if (sd) { if (sd.settings.api_key_managed && env.WSYSTEM_PROVISION_SECRET) ctx.waitUntil(fetch(`${env.API_BASE || "https://api.wsystem.dev"}/billing/shopify/provision`, { method: "POST", headers: { "content-type": "application/json", "x-provision-secret": env.WSYSTEM_PROVISION_SECRET }, body: JSON.stringify({ shop, plan: "shop_free" }) }).catch(() => {})); await putShop(env, shop, { settings: sd.settings }); } }
         } else if (path === "/webhooks/compliance") {
           const p = JSON.parse(body); p.__topic = topicHdr; ctx.waitUntil(onCompliance(env, JSON.stringify(p)));
         } else return new Response("not found", { status: 404 });
@@ -257,6 +306,7 @@ export default {
           for (const k of Object.keys(DEFAULT_SETTINGS)) {
             if (typeof d[k] !== "string") continue;
             if (k === "api_key" && (d[k] === "********" || d[k].trim() === "")) continue; // never wipe a stored key with a blank field
+            if (k === "api_key" && d[k].trim() !== sd.settings.api_key) delete s.api_key_managed; // merchant typed their own key
             s[k] = d[k].trim().slice(0, 300);
           }
           if (!["xrechnung", "en16931", "peppol-bis3"].includes(s.format)) s.format = "xrechnung";
@@ -284,17 +334,18 @@ export default {
           await audit(env, shop, "data-request-read", "");
           return new Response(JSON.stringify({ requests: items }), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
         }
-        if (path === "/api/billing" && req.method === "GET") return json({ live: plansOf(env).length > 0, plans: plansOf(env) });
+        if (path === "/api/billing" && req.method === "GET") return json({ live: plansOf(env).length > 0, plans: plansOf(env).map(({ ws, ...x }) => x), managed_key: !!sd.settings.api_key_managed, free_invoices: 25 });
+        if (path === "/api/billing/sync" && req.method === "POST") return json(await syncBilling(env, shop, sd));
         if (path === "/api/billing/subscribe" && req.method === "POST") {
           const plans = plansOf(env); const { plan } = await req.json().catch(() => ({}));
           const pl = plans.find((x) => x.id === plan);
-          if (!plans.length) return json({ ok: false, reason: "billing_not_enabled", error: "Paid plans are not available yet. The app is free to use with your W System API key." });
+          if (!plans.length) return json({ ok: false, reason: "billing_not_enabled", error: "Paid plans are not available right now. The app stays free for 25 invoices a month." });
           if (!pl) return json({ ok: false, reason: "unknown_plan", error: "Unknown plan." });
           if (!sd.token) return json({ ok: false, reason: "no_access_token", error: "Reopen the app and try again." });
           const handle = shop.replace(/\.myshopify\.com$/, "");
           const r = await fetch(`https://${shop}/admin/api/${env.SHOPIFY_API_VERSION}/graphql.json`, { method: "POST", headers: { "X-Shopify-Access-Token": sd.token, "content-type": "application/json" },
             body: JSON.stringify({ query: "mutation($name:String!,$url:URL!,$test:Boolean,$lines:[AppSubscriptionLineItemInput!]!){ appSubscriptionCreate(name:$name,returnUrl:$url,test:$test,lineItems:$lines){ confirmationUrl userErrors{message} } }",
-              variables: { name: pl.name, url: `https://admin.shopify.com/store/${handle}/apps/${env.SHOPIFY_API_KEY}`, test: env.BILLING_TEST === "1", lines: [{ plan: { appRecurringPricingDetails: { price: { amount: pl.price, currencyCode: pl.currency || "EUR" }, interval: "EVERY_30_DAYS" } } }] } }) });
+              variables: { name: pl.name, url: `https://admin.shopify.com/store/${handle}/apps/${env.SHOPIFY_API_KEY}`, test: env.BILLING_TEST === "1", lines: [{ plan: { appRecurringPricingDetails: { price: { amount: pl.price, currencyCode: pl.currency || "USD" }, interval: pl.interval || "EVERY_30_DAYS" } } }] } }) });
           const d = await r.json().catch(() => ({})); const c = d.data && d.data.appSubscriptionCreate;
           if (!c || !c.confirmationUrl) return json({ ok: false, reason: "billing_error", error: (c && c.userErrors && c.userErrors[0] && c.userErrors[0].message) || "Shopify did not create the subscription." });
           return json({ ok: true, confirmationUrl: c.confirmationUrl });

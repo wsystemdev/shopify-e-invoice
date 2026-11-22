@@ -102,7 +102,7 @@ test("ensureWebhooks creates only missing subscriptions through GraphQL", async 
   const f = async (u, i) => { const b = JSON.parse(i.body); sent.push(b); if (b.query.startsWith("{")) return new Response(JSON.stringify({ data: { webhookSubscriptions: { nodes: [{ topic: "ORDERS_PAID", endpoint: { callbackUrl: "https://app.example/webhooks/orders-paid" } }] } } }));
     return new Response(JSON.stringify({ data: { webhookSubscriptionCreate: { userErrors: [] } } })); };
   const made = await ensureWebhooks(e, SHOP, "tok", f);
-  assert.deepEqual(made, ["ORDERS_CREATE", "APP_UNINSTALLED"]);
+  assert.deepEqual(made, ["ORDERS_CREATE", "APP_UNINSTALLED", "APP_SUBSCRIPTIONS_UPDATE"]);
   assert.equal(sent[1].variables.s.callbackUrl, "https://app.example/webhooks/orders-create");
 });
 test("other /shopify-* site pages pass through to the origin", async () => {
@@ -219,9 +219,33 @@ test("customers/data_request exports the requested invoice records; redact and s
 test("billing: no plan live by default; configured plan creates a subscription via GraphQL", async () => {
   const e = env(); await e.STORE.put(`shop:${SHOP}`, JSON.stringify({ token: await seal(e.ENC_KEY, "shpat_x"), refresh: "", exp: Math.floor(Date.now() / 1000) + 3000, rexp: 0, settings: { seller_name: "M" } })); const h = { authorization: "Bearer " + (await jwt(claims())), "content-type": "application/json" };
   const call = async (path, body) => (await app.fetch(new Request("https://wsystem.dev/shopify" + path, { method: body ? "POST" : "GET", headers: h, body: body && JSON.stringify(body) }), e, ctx())).json();
-  assert.equal((await call("/api/billing")).live, false); assert.equal((await call("/api/billing/subscribe", { plan: "x" })).reason, "billing_not_enabled");
+  assert.equal((await call("/api/billing")).live, true); assert.equal((await call("/api/billing")).plans.length, 6); e.BILLING_PLANS = "[]"; assert.equal((await call("/api/billing")).live, false); assert.equal((await call("/api/billing/subscribe", { plan: "x" })).reason, "billing_not_enabled");
   e.BILLING_PLANS = JSON.stringify([{ id: "p1", name: "Plan", price: "1.00", currency: "EUR" }]); e.BILLING_TEST = "1";
   const orig = globalThis.fetch; let sent;
   globalThis.fetch = async (u, i) => { if (String(u).includes("graphql")) { sent = JSON.parse(i.body); return new Response(JSON.stringify({ data: { appSubscriptionCreate: { confirmationUrl: "https://x/confirm", userErrors: [] } } })); } return new Response("{}", { status: 400 }); };
   try { const r = await call("/api/billing/subscribe", { plan: "p1" }); assert.equal(r.confirmationUrl, "https://x/confirm"); assert.equal(sent.variables.test, true); } finally { globalThis.fetch = orig; }
 });
+
+test("billing sync: free key on install, upgrade on active subscription, downgrade on cancel, own key kept", async () => {
+  const e = env(); e.WSYSTEM_PROVISION_SECRET = "p".repeat(32); await seedShop(e);
+  const calls = []; let active = [];
+  let have = false;
+  const f = async (u, i) => {
+    if (String(u).includes("graphql")) return new Response(JSON.stringify({ data: { currentAppInstallation: { activeSubscriptions: active } } }));
+    const b = JSON.parse(i.body); calls.push(b); assert.equal(i.headers["x-provision-secret"], "p".repeat(32));
+    const existing = have; have = true;
+    return new Response(JSON.stringify({ ok: true, plan: b.plan, quota: 1, api_key: existing && !b.rotate ? null : "wsk_live_" + b.plan, existing: existing && !b.rotate }));
+  };
+  const sd0 = async () => JSON.parse(await e.STORE.get(`shop:${SHOP}`)); const { syncBilling } = await import("../src/index.js");
+  let r = await syncBilling(e, SHOP, await getSd(e), { f }); assert.equal(r.plan, "shop_free");
+  assert.equal(calls[0].plan, "shop_free"); assert.equal(await unseal(e.ENC_KEY, (await sd0()).settings.api_key), "wsk_live_shop_free");
+  active = [{ id: "gid://1", name: "W System Shop Plus", status: "ACTIVE" }];
+  r = await syncBilling(e, SHOP, await getSd(e), { f }); assert.equal(r.plan, "shop_plus"); assert.equal(calls.at(-1).subscription_id, "gid://1");
+  active = []; r = await syncBilling(e, SHOP, await getSd(e), { f }); assert.equal(r.plan, "shop_free");
+  // merchant with an own key and no subscription: nothing provisioned
+  const e2 = env(); e2.WSYSTEM_PROVISION_SECRET = "p".repeat(32); await seedShop(e2, { api_key: "own" }); calls.length = 0;
+  r = await syncBilling(e2, SHOP, await getSd(e2), { f }); assert.equal(r.plan, "own_key"); assert.equal(calls.length, 0);
+  // no secret configured: off
+  assert.equal((await syncBilling(env(), SHOP, { token: "x", settings: {} }, { f })).reason, "provisioning_off");
+});
+async function getSd(e) { const sd = JSON.parse(await e.STORE.get(`shop:${SHOP}`)); sd.token = "shpat_x"; return sd; }
