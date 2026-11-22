@@ -216,14 +216,15 @@ test("customers/data_request exports the requested invoice records; redact and s
   assert.equal(JSON.parse(await e.STORE.get(`idx:${SHOP}`)).length, 0);
   await wh(e, "/webhooks/compliance", { shop_domain: SHOP }, "shop/redact"); assert.equal(e.STORE.m.size, 0);
 });
-test("billing: no plan live by default; configured plan creates a subscription via GraphQL", async () => {
-  const e = env(); await e.STORE.put(`shop:${SHOP}`, JSON.stringify({ token: await seal(e.ENC_KEY, "shpat_x"), refresh: "", exp: Math.floor(Date.now() / 1000) + 3000, rexp: 0, settings: { seller_name: "M" } })); const h = { authorization: "Bearer " + (await jwt(claims())), "content-type": "application/json" };
+test("billing: managed plans, hosted pricing page url, plan matching by name or handle", async () => {
+  const e = env(); await seedShop(e, {}); const h = { authorization: "Bearer " + await jwt(claims()) };
   const call = async (path, body) => (await app.fetch(new Request("https://wsystem.dev/shopify" + path, { method: body ? "POST" : "GET", headers: h, body: body && JSON.stringify(body) }), e, ctx())).json();
-  assert.equal((await call("/api/billing")).live, true); assert.equal((await call("/api/billing")).plans.length, 6); e.BILLING_PLANS = "[]"; assert.equal((await call("/api/billing")).live, false); assert.equal((await call("/api/billing/subscribe", { plan: "x" })).reason, "billing_not_enabled");
-  e.BILLING_PLANS = JSON.stringify([{ id: "p1", name: "Plan", price: "1.00", currency: "EUR" }]); e.BILLING_TEST = "1";
-  const orig = globalThis.fetch; let sent;
-  globalThis.fetch = async (u, i) => { if (String(u).includes("graphql")) { sent = JSON.parse(i.body); return new Response(JSON.stringify({ data: { appSubscriptionCreate: { confirmationUrl: "https://x/confirm", userErrors: [] } } })); } return new Response("{}", { status: 400 }); };
-  try { const r = await call("/api/billing/subscribe", { plan: "p1" }); assert.equal(r.confirmationUrl, "https://x/confirm"); assert.equal(sent.variables.test, true); } finally { globalThis.fetch = orig; }
+  const b = await call("/api/billing"); assert.equal(b.live, true); assert.equal(b.plans.length, 4); assert.equal(b.pricing_url, "https://admin.shopify.com/store/demo/charges/w-system-e-invoice/pricing_plans");
+  assert.equal((await call("/api/billing/subscribe", {})).url, b.pricing_url);
+  const { matchPlan, DEFAULT_PLANS } = await import("../src/index.js");
+  for (const [sub, id] of [[{ name: "Shop Plus" }, "shop_plus"], [{ name: "W System Shop Pro" }, "shop_pro"], [{ name: "x", handle: "shop" }, "shop"], [{ name: "Free" }, "free"]]) assert.equal(matchPlan(DEFAULT_PLANS, sub).id, id);
+  assert.equal(matchPlan(DEFAULT_PLANS, { name: "Other" }), undefined);
+  e.BILLING_PLANS = "[]"; assert.equal((await call("/api/billing")).live, false);
 });
 
 test("billing sync: free key on install, upgrade on active subscription, downgrade on cancel, own key kept", async () => {
@@ -239,7 +240,7 @@ test("billing sync: free key on install, upgrade on active subscription, downgra
   const sd0 = async () => JSON.parse(await e.STORE.get(`shop:${SHOP}`)); const { syncBilling } = await import("../src/index.js");
   let r = await syncBilling(e, SHOP, await getSd(e), { f }); assert.equal(r.plan, "shop_free");
   assert.equal(calls[0].plan, "shop_free"); assert.equal(await unseal(e.ENC_KEY, (await sd0()).settings.api_key), "wsk_live_shop_free");
-  active = [{ id: "gid://1", name: "W System Shop Plus", status: "ACTIVE" }];
+  active = [{ id: "gid://1", name: "Shop Plus", status: "ACTIVE" }];
   r = await syncBilling(e, SHOP, await getSd(e), { f }); assert.equal(r.plan, "shop_plus"); assert.equal(calls.at(-1).subscription_id, "gid://1"); assert.equal(r.current.name, "Shop Plus"); assert.equal(r.current.invoices, 750);
   active = []; r = await syncBilling(e, SHOP, await getSd(e), { f }); assert.equal(r.plan, "shop_free");
   // merchant with an own key and no subscription: nothing provisioned
@@ -250,17 +251,6 @@ test("billing sync: free key on install, upgrade on active subscription, downgra
 });
 async function getSd(e) { const sd = JSON.parse(await e.STORE.get(`shop:${SHOP}`)); sd.token = "shpat_x"; return sd; }
 
-test("isTestShop: allowlist and partnerDevelopment are test; production shop is real", async () => {
-  const { isTestShop } = await import("../src/index.js");
-  const mk = (pd) => async () => new Response(JSON.stringify({ data: { shop: { plan: { partnerDevelopment: pd } } } }));
-  const e = { SHOPIFY_API_VERSION: "2026-07" };
-  assert.equal(await isTestShop(e, "wsystem-einvoice-dev.myshopify.com", "t", mk(false)), true);
-  assert.equal(await isTestShop(e, "other-dev.myshopify.com", "t", mk(true)), true);
-  assert.equal(await isTestShop(e, "real-shop.myshopify.com", "t", mk(false)), false);
-  assert.equal(await isTestShop(e, "real-shop.myshopify.com", "t", async () => { throw new Error("x"); }), false);
-  assert.equal(await isTestShop({ ...e, TEST_SHOPS: "" }, "wsystem-einvoice-dev.myshopify.com", "t", mk(false)), false);
-  assert.equal(await isTestShop({ ...e, BILLING_TEST: "1" }, "real-shop.myshopify.com", "t", mk(false)), true);
-});
 
 test("nightly backup: sealed per-shop bundle in the backup store, restorable, deleted on shop/redact", async () => {
   const { backupAll } = await import("../src/index.js");
