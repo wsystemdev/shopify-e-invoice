@@ -97,10 +97,46 @@ async function verifyQuery(env, url) {
   const msg = [...p.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join("&");
   return safeEq(await hmac(env.SHOPIFY_API_SECRET, msg), given);
 }
-async function shopifyFetch(env, shop, token, path, init = {}) {
-  const r = await fetch(`https://${shop}/admin/api/${env.SHOPIFY_API_VERSION}${path}`, { ...init, headers: { "X-Shopify-Access-Token": token, "content-type": "application/json", ...(init.headers || {}) } });
+
+// Admin GraphQL (REST Admin API is legacy; new public apps must use GraphQL only).
+async function shopifyGql(env, shop, token, query, variables) {
+  const r = await fetch(`https://${shop}/admin/api/${env.SHOPIFY_API_VERSION}/graphql.json`, { method: "POST", headers: { "X-Shopify-Access-Token": token, "content-type": "application/json" }, body: JSON.stringify({ query, variables }) });
   if (!r.ok) throw new Error(`Shopify ${r.status}`);
-  return r.json();
+  const j = await r.json();
+  if (j.errors && j.errors.length) throw new Error(`Shopify GraphQL: ${String(j.errors[0].message || "error").slice(0, 80)}`);
+  return j.data || {};
+}
+const MONEY = "{ shopMoney { amount } }";
+const ADDR = "{ company firstName lastName name address1 address2 city zip countryCodeV2 }";
+const TAXL = `taxLines { rate priceSet ${MONEY} }`;
+const ORDER_FIELDS = `legacyResourceId name createdAt processedAt displayFinancialStatus taxesIncluded currencyCode presentmentCurrencyCode email tags paymentGatewayNames
+  currentTotalPriceSet ${MONEY} totalPriceSet ${MONEY} customAttributes { key value }
+  billingAddress ${ADDR} shippingAddress ${ADDR}
+  lineItems(first: 100) { nodes { title variantTitle sku quantity originalUnitPriceSet ${MONEY} totalDiscountSet ${MONEY} ${TAXL} } }
+  shippingLines(first: 10) { nodes { title originalPriceSet ${MONEY} discountedPriceSet ${MONEY} ${TAXL} } }`;
+// Convert a GraphQL order into the REST-style shape that the mapper (and the webhook payload) use.
+export function gqlOrderToRest(o) {
+  if (!o) return null;
+  const amt = (m) => (m && m.shopMoney ? m.shopMoney.amount : "0");
+  const addr = (a) => (a ? { company: a.company || "", first_name: a.firstName || "", last_name: a.lastName || "", name: a.name || "", address1: a.address1 || "", address2: a.address2 || "", city: a.city || "", zip: a.zip || "", country_code: a.countryCodeV2 || "" } : null);
+  const tl = (x) => (x.taxLines || []).map((t) => ({ rate: t.rate, price: amt(t.priceSet) }));
+  const num = parseInt(String(o.name || "").replace(/\D/g, ""), 10);
+  return {
+    id: Number(o.legacyResourceId), name: o.name, order_number: Number.isFinite(num) ? num : undefined, created_at: o.createdAt, processed_at: o.processedAt,
+    financial_status: String(o.displayFinancialStatus || "").toLowerCase().replace(/ /g, "_"), taxes_included: !!o.taxesIncluded, currency: o.currencyCode, presentment_currency: o.presentmentCurrencyCode,
+    email: o.email || "", tags: (o.tags || []).join(", "), payment_gateway_names: o.paymentGatewayNames || [],
+    current_total_price: amt(o.currentTotalPriceSet), total_price: amt(o.totalPriceSet),
+    note_attributes: (o.customAttributes || []).map((a) => ({ name: a.key, value: a.value })),
+    billing_address: addr(o.billingAddress), shipping_address: addr(o.shippingAddress),
+    line_items: ((o.lineItems && o.lineItems.nodes) || []).map((x) => ({ title: x.title, variant_title: x.variantTitle || "", sku: x.sku || "", quantity: x.quantity, price: amt(x.originalUnitPriceSet), total_discount: amt(x.totalDiscountSet), tax_lines: tl(x) })),
+    shipping_lines: ((o.shippingLines && o.shippingLines.nodes) || []).map((x) => ({ title: x.title, price: amt(x.originalPriceSet), discounted_price: amt(x.discountedPriceSet), tax_lines: tl(x) })),
+  };
+}
+async function findOrder(env, shop, token, digits) {
+  const d = await shopifyGql(env, shop, token, `query($q: String!) { orders(first: 1, query: $q) { nodes { ${ORDER_FIELDS} } } }`, { q: `name:#${digits}` });
+  let node = ((d.orders && d.orders.nodes) || [])[0];
+  if (!node && digits.length > 8) { const g = await shopifyGql(env, shop, token, `query($id: ID!) { order(id: $id) { ${ORDER_FIELDS} } }`, { id: `gid://shopify/Order/${digits}` }); node = g.order; }
+  return gqlOrderToRest(node);
 }
 // Shopify only accepts expiring offline tokens (1 h) with a refresh token (90 days).
 async function tokenRequest(env, shop, params) {
@@ -218,9 +254,9 @@ export async function generate(env, shop, order, shopData, { force = false, f = 
     try {
       const tags = String(order.tags || "").split(",").map((x) => x.trim()).filter((x) => x && !/^e-invoice-/.test(x));
       tags.push(rec.valid ? "e-invoice-valid" : "e-invoice-failed");
-      const o = { id: order.id, tags: tags.join(", ") };
-      if (rec.valid) o.metafields = [{ namespace: "wsystem", key: "einvoice_url", type: "url", value: await dlUrl(env, shop, order.id) }];
-      await shopifyFetch(env, shop, tagToken, `/orders/${order.id}.json`, { method: "PUT", body: JSON.stringify({ order: o }) });
+      const input = { id: `gid://shopify/Order/${order.id}`, tags };
+      if (rec.valid) input.metafields = [{ namespace: "wsystem", key: "einvoice_url", type: "url", value: await dlUrl(env, shop, order.id) }];
+      await shopifyGql(env, shop, tagToken, "mutation($input: OrderInput!) { orderUpdate(input: $input) { order { id } userErrors { message } } }", { input });
     } catch (e) { /* tagging is best effort */ }
   }
   if (rec.valid && s.email_copy === "yes" && env.EMAIL_COPY_ENABLED === "1" && env.RESEND_API_KEY && s.seller_email) {
@@ -375,9 +411,7 @@ export default {
           if (!token) return fail("no_access_token", `No Shopify access token yet (${tokenError || "reopen the app"}).`);
           let order;
           try {
-            let o = await shopifyFetch(env, shop, token, `/orders.json?name=${encodeURIComponent("#" + m[1])}&status=any&limit=1`);
-            order = (o.orders || [])[0];
-            if (!order && m[1].length > 8) { o = await shopifyFetch(env, shop, token, `/orders/${m[1]}.json`); order = o.order; }
+            order = await findOrder(env, shop, token, m[1]);
           } catch (e) { return fail("shopify_error", "Shopify did not return the order (" + String(e.message).slice(0, 60) + "). Check the app has order access.", 200, String(e.message).slice(0, 200)); }
           if (!order) return fail("order_not_found", `Order ${m[1]} was not found in this shop.`);
           if (!sd.settings.seller_name) return fail("no_settings", "Save your seller details first.");

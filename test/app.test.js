@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import app, { generate, ensureWebhooks } from "../src/index.js";
+import app, { generate, ensureWebhooks, gqlOrderToRest } from "../src/index.js";
 import { hmac, seal, unseal, verifySessionToken } from "../src/crypto.js";
 
 class KV { constructor() { this.m = new Map(); }
@@ -43,9 +43,9 @@ test("orders/paid creates and stores a valid invoice, tags order, download works
   globalThis.fetch = async (u, i) => { calls.push([String(u), i]); if (String(u).includes("api.test")) return new Response(JSON.stringify({ valid: true, xml: "<Invoice/>", errors: [], totals: { total_with_vat: 119 } })); return new Response("{}"); };
   try { assert.equal((await wh(e, "/webhooks/orders-paid", ORDER, "orders/paid")).status, 200); } finally { globalThis.fetch = orig; }
   const rec = await e.STORE.get(`inv:${SHOP}:77`, "json"); assert.equal(rec.valid, true); assert.equal(rec.number, "1002");
-  const put = calls.find(([u]) => u.includes("/orders/77.json")); const sent = JSON.parse(put[1].body);
-  assert.match(sent.order.tags, /vip, e-invoice-valid/); assert.match(sent.order.metafields[0].value, /^https:\/\/app\.example\/d\/demo\.myshopify\.com\/77\?t=/);
-  const dl = await app.fetch(new Request(sent.order.metafields[0].value), e, ctx()); assert.equal(dl.status, 200); assert.equal(await dl.text(), "<Invoice/>");
+  const put = calls.find(([u, i]) => u.includes("graphql.json") && i && /orderUpdate/.test(i.body)); const sent = JSON.parse(put[1].body).variables.input;
+  assert.equal(sent.id, "gid://shopify/Order/77"); assert.ok(sent.tags.includes("vip") && sent.tags.includes("e-invoice-valid")); assert.match(sent.metafields[0].value, /^https:\/\/app\.example\/d\/demo\.myshopify\.com\/77\?t=/);
+  const dl = await app.fetch(new Request(sent.metafields[0].value), e, ctx()); assert.equal(dl.status, 200); assert.equal(await dl.text(), "<Invoice/>");
   const bad = await app.fetch(new Request(`https://app.example/d/${SHOP}/77?t=deadbeef`), e, ctx()); assert.equal(bad.status, 404);
 });
 test("orders/create is ignored when trigger is paid; idempotent", async () => {
@@ -174,14 +174,19 @@ test("expired access token is refreshed with the refresh token (webhook path, no
     const fresh = { settings: {}, token: "ok", refresh: "r", exp: now + 3000, rexp: now + 1000 }; body = null; await ensureAccess(e, SHOP, fresh); assert.equal(body, null); // still valid: no request
   } finally { globalThis.fetch = orig; }
 });
+const GQL_ORDER = { legacyResourceId: "77", name: "#1002", createdAt: "2026-11-01T10:00:00Z", processedAt: null, displayFinancialStatus: "PAID", taxesIncluded: true, currencyCode: "EUR", presentmentCurrencyCode: "EUR", email: "k@example.com", tags: ["vip"], paymentGatewayNames: ["manual"],
+  currentTotalPriceSet: { shopMoney: { amount: "119.00" } }, totalPriceSet: { shopMoney: { amount: "119.00" } }, customAttributes: [{ key: "VAT ID", value: "de 123" }],
+  billingAddress: { company: "Kunde AG", firstName: "Eva", lastName: "Kunde", name: "Eva Kunde", address1: "Weg 2", address2: null, city: "Köln", zip: "50667", countryCodeV2: "DE" }, shippingAddress: null,
+  lineItems: { nodes: [{ title: "Item", variantTitle: null, sku: "A1", quantity: 1, originalUnitPriceSet: { shopMoney: { amount: "119.00" } }, totalDiscountSet: { shopMoney: { amount: "0.00" } }, taxLines: [{ rate: 0.19, priceSet: { shopMoney: { amount: "19.00" } } }] }] }, shippingLines: { nodes: [] } };
+test("gqlOrderToRest gives the REST shape the mapper expects", () => { const o = gqlOrderToRest(GQL_ORDER); assert.equal(o.id, 77); assert.equal(o.financial_status, "paid"); assert.equal(o.line_items[0].tax_lines[0].price, "19.00"); assert.equal(o.billing_address.country_code, "DE"); assert.equal(o.note_attributes[0].name, "VAT ID"); assert.equal(o.tags, "vip"); });
 test("/api/create: reason codes, regenerates an existing invoice, no 500", async () => {
   const e = env(); const now = Math.floor(Date.now() / 1000);
   await e.STORE.put(`shop:${SHOP}`, JSON.stringify({ token: await seal(e.ENC_KEY, "shpat_x"), refresh: "", exp: now + 3000, rexp: 0, settings: { seller_name: "M GmbH" } }));
   const h = { authorization: "Bearer " + (await jwt(claims())), "content-type": "application/json" };
   const call = async (order) => (await app.fetch(new Request("https://wsystem.dev/shopify/api/create", { method: "POST", headers: h, body: JSON.stringify({ order }) }), e, ctx())).json();
   const orig = globalThis.fetch; let shopifyStatus = 200;
-  globalThis.fetch = async (u) => { u = String(u);
-    if (u.includes("/orders.json")) return shopifyStatus !== 200 ? new Response("{}", { status: shopifyStatus }) : new Response(JSON.stringify({ orders: u.includes("%231002") ? [ORDER] : [] }));
+  globalThis.fetch = async (u, i) => { u = String(u);
+    if (u.includes("graphql.json")) { if (shopifyStatus !== 200) return new Response("{}", { status: shopifyStatus }); const q = JSON.parse(i.body); return new Response(JSON.stringify({ data: { orders: { nodes: q.variables && q.variables.q === "name:#1002" ? [GQL_ORDER] : [] } } })); }
     if (u.includes("api.wsystem") || u.includes("api.test")) return new Response(JSON.stringify({ valid: true, xml: "<I/>", errors: [] }));
     return new Response("{}"); };
   try {
