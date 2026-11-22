@@ -192,3 +192,36 @@ test("/api/create: reason codes, regenerates an existing invoice, no 500", async
     shopifyStatus = 403; const bad = await call("1002"); assert.equal(bad.reason, "shopify_error"); assert.match(bad.error, /403/);
   } finally { globalThis.fetch = orig; }
 });
+
+test("regeneration is idempotent: one KV record and one list row; list is no-store and fresh", async () => {
+  const e = env(); const orig = globalThis.fetch;
+  globalThis.fetch = async (u) => new Response(JSON.stringify({ valid: true, xml: "<I/>", errors: [] }));
+  try {
+    const sd = { settings: { seller_name: "M" }, token: "" };
+    await generate(e, SHOP, ORDER, sd, { force: true }); await generate(e, SHOP, ORDER, sd, { force: true });
+    assert.equal([...e.STORE.m.keys()].filter((k) => k.startsWith("inv:")).length, 1);
+    const h = { authorization: "Bearer " + (await jwt(claims())) };
+    const r = await app.fetch(new Request("https://wsystem.dev/shopify/api/invoices", { headers: h }), e, ctx());
+    assert.equal(r.headers.get("cache-control"), "no-store"); const j = await r.json(); assert.equal(j.invoices.length, 1); assert.equal(j.invoices[0].order, "1002");
+    assert.ok([...e.STORE.m.keys()].some((k) => k.startsWith(`aud:${SHOP}:`)));
+  } finally { globalThis.fetch = orig; }
+});
+test("customers/data_request exports the requested invoice records; redact and shop/redact clear index, export and access log", async () => {
+  const e = env(); await seedShop(e); const sd = { settings: { seller_name: "M" }, token: "" }; const orig = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ valid: true, xml: "<I/>", errors: [] }));
+  try { await generate(e, SHOP, ORDER, sd, { force: true }); } finally { globalThis.fetch = orig; }
+  await wh(e, "/webhooks/compliance", { shop_domain: SHOP, data_request: { id: 9 }, orders_requested: [77] }, "customers/data_request");
+  const dsr = JSON.parse(await e.STORE.get(`dsr:${SHOP}:9`)); assert.equal(dsr.records.length, 1); assert.equal(dsr.records[0].xml, "<I/>");
+  await wh(e, "/webhooks/compliance", { shop_domain: SHOP, orders_to_redact: [77] }, "customers/redact");
+  assert.equal(JSON.parse(await e.STORE.get(`idx:${SHOP}`)).length, 0);
+  await wh(e, "/webhooks/compliance", { shop_domain: SHOP }, "shop/redact"); assert.equal(e.STORE.m.size, 0);
+});
+test("billing: no plan live by default; configured plan creates a subscription via GraphQL", async () => {
+  const e = env(); await e.STORE.put(`shop:${SHOP}`, JSON.stringify({ token: await seal(e.ENC_KEY, "shpat_x"), refresh: "", exp: Math.floor(Date.now() / 1000) + 3000, rexp: 0, settings: { seller_name: "M" } })); const h = { authorization: "Bearer " + (await jwt(claims())), "content-type": "application/json" };
+  const call = async (path, body) => (await app.fetch(new Request("https://wsystem.dev/shopify" + path, { method: body ? "POST" : "GET", headers: h, body: body && JSON.stringify(body) }), e, ctx())).json();
+  assert.equal((await call("/api/billing")).live, false); assert.equal((await call("/api/billing/subscribe", { plan: "x" })).reason, "billing_not_enabled");
+  e.BILLING_PLANS = JSON.stringify([{ id: "p1", name: "Plan", price: "1.00", currency: "EUR" }]); e.BILLING_TEST = "1";
+  const orig = globalThis.fetch; let sent;
+  globalThis.fetch = async (u, i) => { if (String(u).includes("graphql")) { sent = JSON.parse(i.body); return new Response(JSON.stringify({ data: { appSubscriptionCreate: { confirmationUrl: "https://x/confirm", userErrors: [] } } })); } return new Response("{}", { status: 400 }); };
+  try { const r = await call("/api/billing/subscribe", { plan: "p1" }); assert.equal(r.confirmationUrl, "https://x/confirm"); assert.equal(sent.variables.test, true); } finally { globalThis.fetch = orig; }
+});

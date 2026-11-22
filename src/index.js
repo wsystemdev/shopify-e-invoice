@@ -5,6 +5,8 @@ import { adminPage } from "./admin.js";
 const SHOP_RE = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
 const TTL = 60 * 60 * 24 * 400; // invoices expire after about 13 months
 const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
+// Billing: NO plan is live. Plans come from env BILLING_PLANS (JSON array of {id,name,price,currency}); empty = free to install.
+function plansOf(env) { try { const p = JSON.parse(env.BILLING_PLANS || "[]"); return Array.isArray(p) ? p : []; } catch (e) { return []; } }
 const SECRET_FIELD = "api_key";
 
 // ---------- storage ----------
@@ -23,7 +25,7 @@ async function putShop(env, shop, { token, refresh, exp, rexp, settings }) {
   await env.STORE.put(`shop:${shop}`, JSON.stringify({ token: token ? await seal(env.ENC_KEY, token) : "", refresh: refresh ? await seal(env.ENC_KEY, refresh) : "", exp: exp || 0, rexp: rexp || 0, settings: s }));
 }
 export async function deleteShopData(env, shop) {
-  for (const prefix of [`inv:${shop}:`, `dsr:${shop}:`]) {
+  for (const prefix of [`inv:${shop}:`, `dsr:${shop}:`, `aud:${shop}:`]) {
     let cursor;
     do {
       const l = await env.STORE.list({ prefix, cursor });
@@ -31,7 +33,19 @@ export async function deleteShopData(env, shop) {
       cursor = l.list_complete ? undefined : l.cursor;
     } while (cursor);
   }
+  await env.STORE.delete(`idx:${shop}`);
   await env.STORE.delete(`shop:${shop}`);
+}
+
+// Per-record access log (who/what touched an invoice), kept 90 days. Never stores the invoice content.
+async function audit(env, shop, action, id) {
+  try { await env.STORE.put(`aud:${shop}:${new Date().toISOString()}:${Math.random().toString(36).slice(2, 6)}`, JSON.stringify({ action, id: String(id || "") }), { expirationTtl: 60 * 60 * 24 * 90 }); } catch (e) { /* best effort */ }
+}
+// Small consistent index of recent invoices (KV list() is eventually consistent, so the list endpoint reads this instead).
+async function idxUpdate(env, shop, id, entry) {
+  const key = `idx:${shop}`; const cur = (await env.STORE.get(key, "json")) || [];
+  const next = [{ id: String(id), ...entry }, ...cur.filter((x) => x.id !== String(id))].slice(0, 50);
+  await env.STORE.put(key, JSON.stringify(next), { expirationTtl: TTL });
 }
 
 // ---------- Shopify ----------
@@ -100,14 +114,6 @@ export async function ensureWebhooks(env, shop, token, f = fetch) {
   }
   return created;
 }
-// Fallback for shops owned by our own organisation (dev store): client credentials grant, 24 h token, never stored.
-async function clientCredentialsToken(env, shop) {
-  try {
-    const r = await fetch(`https://${shop}/admin/oauth/access_token`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({ client_id: env.SHOPIFY_API_KEY, client_secret: env.SHOPIFY_API_SECRET, grant_type: "client_credentials" }) });
-    return r.ok ? (await r.json()).access_token || "" : "";
-  } catch (e) { return ""; }
-}
 const dlUrl = async (env, shop, id) => `${env.APP_URL}/d/${shop}/${id}?t=${(await hmac(env.ENC_KEY, `dl|${shop}|${id}`)).slice(0, 32)}`;
 
 // ---------- invoice lifecycle ----------
@@ -132,8 +138,10 @@ export async function generate(env, shop, order, shopData, { force = false, f = 
     rec = { order: orderNumber(order), number: body.invoice_number, format: body.format, valid: p.valid, xml: p.valid ? p.xml : "", errors: p.errors, mismatch: p.mismatch, created: new Date().toISOString() };
   }
   await env.STORE.put(key, JSON.stringify(rec), { expirationTtl: TTL, metadata: { order: rec.order, number: rec.number, valid: rec.valid, created: rec.created } });
+  await idxUpdate(env, shop, order.id, { order: rec.order, number: rec.number, valid: rec.valid, created: rec.created, xml: !!rec.xml, errors: (rec.errors || []).slice(0, 2) });
+  await audit(env, shop, "generate", order.id);
   // tag + metafield on the order (needs an access token)
-  const tagToken = shopData.token || (f === fetch ? await clientCredentialsToken(env, shop) : "");
+  const tagToken = shopData.token;
   if (tagToken) {
     try {
       const tags = String(order.tags || "").split(",").map((x) => x.trim()).filter((x) => x && !/^e-invoice-/.test(x));
@@ -173,12 +181,17 @@ async function onCompliance(env, body) {
   const topic = p.__topic;
   if (topic === "shop/redact") return deleteShopData(env, shop);
   if (topic === "customers/redact") {
-    for (const id of p.orders_to_redact || []) await env.STORE.delete(`inv:${shop}:${id}`);
+    const gone = new Set((p.orders_to_redact || []).map(String));
+    for (const id of gone) await env.STORE.delete(`inv:${shop}:${id}`);
+    const cur = (await env.STORE.get(`idx:${shop}`, "json")) || [];
+    await env.STORE.put(`idx:${shop}`, JSON.stringify(cur.filter((x) => !gone.has(x.id))), { expirationTtl: TTL });
     return;
   }
   if (topic === "customers/data_request") {
-    // Invoices are stored per order and visible to the merchant in the app; record the request so the merchant can fulfil it.
-    await env.STORE.put(`dsr:${shop}:${p.data_request && p.data_request.id || Date.now()}`, JSON.stringify({ orders: p.orders_requested || [], at: new Date().toISOString() }), { expirationTtl: TTL });
+    // Export: copy the stored invoice records (incl. XML) of the requested orders so the merchant can hand them to the customer.
+    const records = [];
+    for (const id of p.orders_requested || []) { const r = await env.STORE.get(`inv:${shop}:${id}`, "json"); if (r) records.push({ order_id: String(id), ...r }); }
+    await env.STORE.put(`dsr:${shop}:${p.data_request && p.data_request.id || Date.now()}`, JSON.stringify({ at: new Date().toISOString(), customer_id: p.customer && p.customer.id, orders: p.orders_requested || [], records }), { expirationTtl: TTL });
   }
 }
 
@@ -222,6 +235,7 @@ export default {
         if (!SHOP_RE.test(shop || "") || !/^\d+$/.test(id || "") || !safeEq((await hmac(env.ENC_KEY, `dl|${shop}|${id}`)).slice(0, 32), t)) return new Response("not found", { status: 404 });
         const rec = await env.STORE.get(`inv:${shop}:${id}`, "json");
         if (!rec || !rec.valid || !rec.xml) return new Response("not found", { status: 404 });
+        await audit(env, shop, "download", id);
         return new Response(rec.xml, { headers: { "content-type": "application/xml; charset=utf-8", "content-disposition": `attachment; filename="${String(rec.number).replace(/[^\w.-]/g, "_")}.xml"`, "cache-control": "no-store" } });
       }
 
@@ -253,14 +267,37 @@ export default {
           return json({ ok: true, webhooks });
         }
         if (path === "/api/invoices") {
-          const l = await env.STORE.list({ prefix: `inv:${shop}:`, limit: 200 });
-          const invoices = await Promise.all(l.keys.map(async (k) => {
-            const m = k.metadata || {}; const id = k.name.split(":")[2];
-            const rec = await env.STORE.get(k.name, "json");
-            return { order: m.order, number: m.number, valid: m.valid, created: m.created, xml: !!(rec && rec.xml), errors: rec ? rec.errors : [], url: await dlUrl(env, shop, id) };
-          }));
-          invoices.sort((a, b) => String(b.created).localeCompare(String(a.created)));
-          return json({ invoices: invoices.slice(0, 25) });
+          let idx = await env.STORE.get(`idx:${shop}`, "json");
+          if (!idx) { // one-time backfill from the key listing (invoices created before the index existed)
+            const l = await env.STORE.list({ prefix: `inv:${shop}:`, limit: 200 });
+            idx = await Promise.all(l.keys.map(async (k) => { const r = (await env.STORE.get(k.name, "json")) || {}; return { id: k.name.split(":")[2], order: r.order, number: r.number, valid: r.valid, created: r.created, xml: !!r.xml, errors: (r.errors || []).slice(0, 2) }; }));
+            idx.sort((a, b) => String(b.created).localeCompare(String(a.created))); idx = idx.slice(0, 50);
+            await env.STORE.put(`idx:${shop}`, JSON.stringify(idx), { expirationTtl: TTL });
+          }
+          const invoices = await Promise.all(idx.slice(0, 25).map(async (i) => ({ order: i.order, number: i.number, valid: i.valid, created: i.created, xml: i.xml, errors: i.errors || [], url: await dlUrl(env, shop, i.id) })));
+          await audit(env, shop, "list", "");
+          return new Response(JSON.stringify({ invoices }), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+        }
+        if (path === "/api/data-requests") {
+          const l = await env.STORE.list({ prefix: `dsr:${shop}:`, limit: 50 });
+          const items = await Promise.all(l.keys.map(async (k) => { const r = await env.STORE.get(k.name, "json"); return { at: r.at, orders: r.orders, records: (r.records || []).map((x) => ({ order: x.order, number: x.number, valid: x.valid, xml: x.xml })) }; }));
+          await audit(env, shop, "data-request-read", "");
+          return new Response(JSON.stringify({ requests: items }), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+        }
+        if (path === "/api/billing" && req.method === "GET") return json({ live: plansOf(env).length > 0, plans: plansOf(env) });
+        if (path === "/api/billing/subscribe" && req.method === "POST") {
+          const plans = plansOf(env); const { plan } = await req.json().catch(() => ({}));
+          const pl = plans.find((x) => x.id === plan);
+          if (!plans.length) return json({ ok: false, reason: "billing_not_enabled", error: "Paid plans are not available yet. The app is free to use with your W System API key." });
+          if (!pl) return json({ ok: false, reason: "unknown_plan", error: "Unknown plan." });
+          if (!sd.token) return json({ ok: false, reason: "no_access_token", error: "Reopen the app and try again." });
+          const handle = shop.replace(/\.myshopify\.com$/, "");
+          const r = await fetch(`https://${shop}/admin/api/${env.SHOPIFY_API_VERSION}/graphql.json`, { method: "POST", headers: { "X-Shopify-Access-Token": sd.token, "content-type": "application/json" },
+            body: JSON.stringify({ query: "mutation($name:String!,$url:URL!,$test:Boolean,$lines:[AppSubscriptionLineItemInput!]!){ appSubscriptionCreate(name:$name,returnUrl:$url,test:$test,lineItems:$lines){ confirmationUrl userErrors{message} } }",
+              variables: { name: pl.name, url: `https://admin.shopify.com/store/${handle}/apps/${env.SHOPIFY_API_KEY}`, test: env.BILLING_TEST === "1", lines: [{ plan: { appRecurringPricingDetails: { price: { amount: pl.price, currencyCode: pl.currency || "EUR" }, interval: "EVERY_30_DAYS" } } }] } }) });
+          const d = await r.json().catch(() => ({})); const c = d.data && d.data.appSubscriptionCreate;
+          if (!c || !c.confirmationUrl) return json({ ok: false, reason: "billing_error", error: (c && c.userErrors && c.userErrors[0] && c.userErrors[0].message) || "Shopify did not create the subscription." });
+          return json({ ok: true, confirmationUrl: c.confirmationUrl });
         }
         if (path === "/api/create" && req.method === "POST") {
           const fail = (reason, message, status = 200, extra = "") => { console.log("create failed:", reason, extra); return json({ ok: false, reason, error: message }, status); };
@@ -280,6 +317,7 @@ export default {
           if (!order) return fail("order_not_found", `Order ${m[1]} was not found in this shop.`);
           if (!sd.settings.seller_name) return fail("no_settings", "Save your seller details first.");
           const existing = await env.STORE.get(`inv:${shop}:${order.id}`, "json");
+          await audit(env, shop, "manual-create", order.id);
           let rec;
           try { rec = await generate(env, shop, order, { ...sd, token }, { force: true }); } catch (e) { return fail("generate_error", "Could not create the e-invoice.", 200, String(e.message).slice(0, 200)); }
           return json({ ok: true, valid: rec.valid, regenerated: !!existing, errors: rec.errors || [] });

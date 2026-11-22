@@ -40,7 +40,7 @@ ${f("default_buyer_reference", t.ref)}<div class="h">${esc(t.refh)}</div>${f("va
 <div class="card"><h2>${esc(t.orders)}</h2><div id="list">${esc(t.none)}</div></div></main>
 <script>
 const BASE=${JSON.stringify(base)};const L=${JSON.stringify({ err: t.err,  ok: t.ok, bad: t.bad, dl: t.dl, none: t.none, saved: t.saved, order: t.order, status: t.status, number: t.number })};
-async function api(p,o={}){const tok=await shopify.idToken();const r=await fetch(BASE+p,{...o,headers:{...(o.headers||{}),Authorization:"Bearer "+tok,"content-type":"application/json"}});if(!r.ok&&r.status!==400){let m="HTTP "+r.status;try{const j=await r.json();m=j.error||m}catch(e){}throw new Error(m)}return r.json()}
+async function api(p,o={}){const tok=await shopify.idToken();const r=await fetch(BASE+p,{cache:"no-store",...o,headers:{...(o.headers||{}),Authorization:"Bearer "+tok,"content-type":"application/json"}});if(!r.ok&&r.status!==400){let m="HTTP "+r.status;try{const j=await r.json();m=j.error||m}catch(e){}throw new Error(m)}return r.json()}
 function toast(m,isErr){try{shopify.toast.show(m,{isError:!!isErr,duration:4000})}catch(e){}const el=document.getElementById("toast");el.textContent=m;el.className=isErr?"bad":"ok";el.style.display="block";clearTimeout(window._tt);window._tt=setTimeout(()=>el.style.display="none",5000)}
 const F=document.getElementById("f");
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}

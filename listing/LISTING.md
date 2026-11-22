@@ -23,6 +23,7 @@ W System E-Invoice creates a structured e-invoice for each order and checks it b
 **Search terms:** xrechnung, e-rechnung, e-invoice, en 16931, peppol
 **Support:** hello@wsystem.dev, https://wsystem.dev/shopify-xrechnung
 **Privacy policy:** https://wsystem.dev/privacy   **Terms:** https://wsystem.dev/terms
+**Scope (state honestly in the listing):** built for business-to-business (B2B) orders. Consumer (B2C) orders do not need an e-invoice in Germany; use "Only for business customers". The customer VAT ID and Leitweg-ID must be collected as order attributes (checkout field or app).
 **Limits stated honestly:** no ZUGFeRD PDF, no credit notes for refunds yet, no tips or gift cards; not tax or legal advice.
 
 ## Deutsch
@@ -50,3 +51,14 @@ W System E-Rechnung erstellt zu jeder Bestellung eine strukturierte E-Rechnung u
 - Accepting the Shopify Partner Program Agreement and API terms is a contract: needs his OK.
 - Protected customer data access (name, address, email on orders) must be requested in the Partner Dashboard and is reviewed by Shopify.
 - Review checks: GDPR webhooks (done), session-token auth (done), a test store and instructions for the reviewer.
+
+## Screenshots to capture (1600x900, dev store wsystem-einvoice-dev, Browser Ops)
+1. App settings page (seller data filled, key masked).
+2. Recent e-invoices list showing Valid rows with Download XML.
+3. An order in the Shopify admin with the tag e-invoice-valid.
+4. The downloaded XRechnung XML opened in a viewer (shows CustomizationID urn:cen.eu:en16931:2017#compliant#urn:xeinkauf.de:kosit:xrechnung_3.0).
+5. A failed validation row with its fix hint (optional, shows the checking).
+Current demo-data images exist in this folder (screenshot-1/2-en/de.png) and can be used as a fallback.
+
+## Listing fields summary
+Support email: hello@wsystem.dev. Privacy: https://wsystem.dev/privacy. Terms: https://wsystem.dev/terms. Public name everywhere: W System.
