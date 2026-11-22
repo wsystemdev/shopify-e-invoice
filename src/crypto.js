@@ -1,5 +1,5 @@
 const enc = new TextEncoder();
-const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const b64 = (buf) => { const u = new Uint8Array(buf); let s = ""; for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode(...u.subarray(i, i + 8192)); return btoa(s); };
 const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 export const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 export async function hmac(secret, data, out = "hex") {

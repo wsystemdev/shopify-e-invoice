@@ -21,7 +21,7 @@ W System E-Invoice creates a structured e-invoice for each order and checks it b
 - English and German
 **Pricing:** Free: 25 e-invoices a month. Shop: $13 a month for 150. Shop Plus: $32 a month for 750. Shop Pro: $65 a month for 2,000. Annual billing: pay 10 months, get 12 ($130, $320, $650 a year). Same as our EUR prices in every store (EUR 12, 29, 59). Billed through Shopify in USD.
 **Search terms:** xrechnung, e-rechnung, e-invoice, en 16931, peppol
-**Support:** hello@wsystem.dev, https://wsystem.dev/shopify-xrechnung
+**Support:** hello@wsystem.dev, https://wsystem.dev/support
 **Privacy policy:** https://wsystem.dev/privacy   **Terms:** https://wsystem.dev/terms
 **Scope (state honestly in the listing):** built for business-to-business (B2B) orders. Consumer (B2C) orders do not need an e-invoice in Germany; use "Only for business customers". The customer VAT ID and Leitweg-ID must be collected as order attributes (checkout field or app).
 **Limits stated honestly:** no ZUGFeRD PDF, no credit notes for refunds yet, no tips or gift cards; not tax or legal advice.

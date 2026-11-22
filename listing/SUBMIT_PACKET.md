@@ -29,7 +29,7 @@ Dev Dashboard > Apps > W System E-Invoice > Settings > Access requests > Protect
 
 10. **Are test and production data separated, and is real customer data used in development/testing?** Development uses a Shopify development store with fake orders only. Production uses the one Worker and KV namespace; no production data is copied to dev.
 
-11. **Do you have backups, and are they protected / deleted with the data?** No separate backups of customer data are made. KV is managed by Cloudflare. Expiry and redact deletions therefore apply everywhere.
+11. **Do you have backups, and are they protected / deleted with the data?** Yes, encrypted. A nightly job (Cloudflare Worker cron, 02:17 UTC) copies each shop's records (settings and access tokens, which are already encrypted, plus invoice records, index and access log) into a separate Cloudflare KV store. Each shop's bundle is encrypted again with AES-256-GCM using a separate backup key that is not used for anything else. Backups expire automatically after 30 days, and a shop/redact request deletes that shop's backups together with its live data.
 
 12. **Who can access protected customer data (staff access limited)?** Only the single operator of the W System Cloudflare account, protected by 2FA. No other staff or contractors have access. The W System API processes the order data transiently; The API does not log request bodies (access logs hold URL and status only). 
 
@@ -64,7 +64,7 @@ W System E-Invoice creates a structured e-invoice for each order and checks it b
 - English and German
 **Pricing:** Free: 25 e-invoices a month. Shop: $13 a month for 150. Shop Plus: $32 a month for 750. Shop Pro: $65 a month for 2,000. Annual billing: pay 10 months, get 12 ($130, $320, $650 a year). Same as our EUR prices in every store (EUR 12, 29, 59). Billed through Shopify in USD.
 **Search terms:** xrechnung, e-rechnung, e-invoice, en 16931, peppol
-**Support:** hello@wsystem.dev, https://wsystem.dev/shopify-xrechnung
+**Support:** hello@wsystem.dev, https://wsystem.dev/support
 **Privacy policy:** https://wsystem.dev/privacy   **Terms:** https://wsystem.dev/terms
 **Scope (state honestly in the listing):** built for business-to-business (B2B) orders. Consumer (B2C) orders do not need an e-invoice in Germany; use "Only for business customers". The customer VAT ID and Leitweg-ID must be collected as order attributes (checkout field or app).
 **Limits stated honestly:** no ZUGFeRD PDF, no credit notes for refunds yet, no tips or gift cards; not tax or legal advice.
@@ -100,12 +100,12 @@ App icon: 1200x1200 W System logo (upload from /workspace/site if available; ask
 Alt texts: 1 "App settings with seller data and format", 2 "Recent e-invoices with validation status and XML download", 3 "Order tagged e-invoice-valid", 4 "Generated XRechnung 3.0 file".
 
 ## 4. Pricing (same price in every store; Shopify bills in USD: $13/$32/$65 monthly, $130/$320/$650 yearly; set in the listing's Pricing section, matching the app's Billing API plans)
-| Plan | Monthly | Annual (10 months for 12) | Included invoices per month |
+| Plan | Monthly (USD) | Annual (USD, 10 months for 12) | Included invoices per month |
 |---|---|---|---|
 | Free | 0 | n/a | 25 |
-| Shop | 12.00 | 120.00 | 150 |
-| Shop Plus | 29.00 | 290.00 | 750 |
-| Shop Pro | 59.00 | 590.00 | 2,000 |
+| Shop | 13.00 | 130.00 | 150 |
+| Shop Plus | 32.00 | 320.00 | 750 |
+| Shop Pro | 65.00 | 650.00 | 2,000 |
 Plan descriptions: "Up to N e-invoices a month, validated against XRechnung and EN 16931 rules." Do not add free trials. Pricing is approved by Zifeng (t-approval in the parent chat), do not change.
 
 ## 5. Instructions for Shopify reviewers (paste into "Testing instructions")
@@ -126,3 +126,7 @@ Dev store for our own demo (read only for reviewers, optional): https://wsystem-
 5. Check the automated checks panel (App Store requirements): expect webhooks, session token auth, and app URL passing. Report any failing check with its text; do not work around it.
 6. Review all fields once, then STOP and report "ready to submit" to the requester. Click Submit for review only after the requester confirms (the owner has not yet said to submit).
 7. After submission, report the confirmation text and any "protected customer data review" notice.
+
+
+## Assets (22 Nov)
+- Icon: listing/icon-1200.png. Feature image: listing/feature-1600x900.png. Screencast (76 s, MP4): https://wsystem.dev/media/shopify-demo.mp4 (file listing/shopify-demo.mp4). Support URL: https://wsystem.dev/support (DE: /de/support). Screenshot 5 (plans): listing/screens/05-plans.png.

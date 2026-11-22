@@ -46,6 +46,30 @@ export async function deleteShopData(env, shop) {
   }
   await env.STORE.delete(`idx:${shop}`);
   await env.STORE.delete(`shop:${shop}`);
+  if (env.BACKUP) { // nightly backups of this shop are deleted with the data
+    let cursor;
+    do { const l = await env.BACKUP.list({ prefix: `bk:${shop}:`, cursor }); await Promise.all(l.keys.map((k) => env.BACKUP.delete(k.name))); cursor = l.list_complete ? undefined : l.cursor; } while (cursor);
+  }
+}
+
+// Nightly backup (cron): every shop's KV records (settings and access tokens are already sealed; invoice records, index, data-request
+// exports, access log) are bundled per shop, encrypted again with a separate key (BACKUP_KEY) and written to a SEPARATE KV namespace
+// (BACKUP) with a 30-day expiry. Deleted with the shop on shop/redact (see deleteShopData).
+export async function backupAll(env, now = new Date()) {
+  if (!env.BACKUP || !env.BACKUP_KEY) return { ok: false, reason: "backup_not_configured" };
+  const groups = new Map(); let cursor;
+  do {
+    const l = await env.STORE.list({ cursor });
+    for (const k of l.keys) { const shop = k.name.split(":")[1] || ""; if (!SHOP_RE.test(shop)) continue; if (!groups.has(shop)) groups.set(shop, []); groups.get(shop).push(k.name); }
+    cursor = l.list_complete ? undefined : l.cursor;
+  } while (cursor);
+  const day = now.toISOString().slice(0, 10); let n = 0;
+  for (const [shop, names] of groups) {
+    const items = {}; for (const name of names) items[name] = await env.STORE.get(name);
+    await env.BACKUP.put(`bk:${shop}:${day}`, await seal(env.BACKUP_KEY, JSON.stringify({ shop, day, items })), { expirationTtl: 30 * 86400 });
+    n++;
+  }
+  return { ok: true, shops: n, day };
 }
 
 // Per-record access log (who/what touched an invoice), kept 90 days. Never stores the invoice content.
@@ -253,6 +277,7 @@ async function onCompliance(env, body) {
 
 // ---------- router ----------
 export default {
+  async scheduled(event, env, ctx) { ctx.waitUntil(backupAll(env).then((r) => console.log("backup", JSON.stringify(r)))); },
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
     // Route pattern is wsystem.dev/shopify* (a bare pattern ignores URLs with a query string), so other pages that

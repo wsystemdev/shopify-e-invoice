@@ -33,7 +33,7 @@ test("session token verification", async () => {
   assert.equal((await verifySessionToken(await jwt(claims({ dest: "https://evil.com" })), "sec", "cid")).reason, "dest_not_myshopify");
   assert.equal((await verifySessionToken("", "sec", "cid")).reason, "missing");
 });
-test("seal/unseal roundtrip", async () => { assert.equal(await unseal("k", await seal("k", "hello")), "hello"); });
+test("seal/unseal roundtrip (incl. large payloads)", async () => { assert.equal(await unseal("k", await seal("k", "hello")), "hello"); const big = "x".repeat(500000); assert.equal(await unseal("k", await seal("k", big)), big); });
 test("webhook rejects bad hmac", async () => {
   const r = await wh(env(), "/webhooks/orders-paid", ORDER, "orders/paid", "wrong"); assert.equal(r.status, 401);
 });
@@ -260,4 +260,19 @@ test("isTestShop: allowlist and partnerDevelopment are test; production shop is 
   assert.equal(await isTestShop(e, "real-shop.myshopify.com", "t", async () => { throw new Error("x"); }), false);
   assert.equal(await isTestShop({ ...e, TEST_SHOPS: "" }, "wsystem-einvoice-dev.myshopify.com", "t", mk(false)), false);
   assert.equal(await isTestShop({ ...e, BILLING_TEST: "1" }, "real-shop.myshopify.com", "t", mk(false)), true);
+});
+
+test("nightly backup: sealed per-shop bundle in the backup store, restorable, deleted on shop/redact", async () => {
+  const { backupAll } = await import("../src/index.js");
+  const e = env(); e.BACKUP = new KV(); e.BACKUP_KEY = "b".repeat(40);
+  await seedShop(e, { api_key: "k" }); await e.STORE.put(`inv:${SHOP}:77`, JSON.stringify({ number: "INV-1", xml: "<x/>" }));
+  await e.STORE.put("inv:other.myshopify.com:1", "{}");
+  assert.equal((await backupAll(e)).shops, 2);
+  const k = `bk:${SHOP}:${new Date().toISOString().slice(0, 10)}`; const raw = await e.BACKUP.get(k);
+  assert.ok(raw && !raw.includes("INV-1") && !raw.includes("<x/>"));
+  const b = JSON.parse(await unseal(e.BACKUP_KEY, raw)); assert.equal(b.shop, SHOP); assert.ok(b.items[`inv:${SHOP}:77`].includes("INV-1"));
+  assert.equal(b.items["inv:other.myshopify.com:1"], undefined);
+  assert.equal((await backupAll({ STORE: e.STORE })).reason, "backup_not_configured");
+  await wh(e, "/webhooks/compliance", { shop_domain: SHOP }, "shop/redact");
+  assert.equal(await e.BACKUP.get(k), null); assert.ok(await e.BACKUP.get(`bk:other.myshopify.com:${new Date().toISOString().slice(0, 10)}`));
 });
