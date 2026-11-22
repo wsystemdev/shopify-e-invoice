@@ -17,9 +17,9 @@ W System E-Invoice creates a structured e-invoice for each order and checks it b
 - Download link on the order (tag and metafield) and a list of recent invoices in the app
 - Several VAT rates, discounts, shipping, bank transfer with IBAN, intra-EU reverse charge, exports, small business scheme (section 19 UStG)
 - Leitweg-ID per order for public-sector buyers
-- Works without an account (20 invoices a day); a free API key adds 500 units a month
+- Free for 25 invoices a month, then from €12 (billed through Shopify). Your W System key is set up automatically
 - English and German
-**Pricing:** Free app. W System API: 20 invoices a day without a key; free key with 500 units a month (8 units per invoice); paid plans at https://wsystem.dev/pricing (billed by W System, not through Shopify).
+**Pricing:** Free: 25 e-invoices a month. Shop: EUR 12 a month for 150. Shop Plus: EUR 29 a month for 750. Shop Pro: EUR 59 a month for 2,000. Annual billing: pay 10 months, get 12 (EUR 120, 290, 590 a year). Same price in every store. Billed through Shopify.
 **Search terms:** xrechnung, e-rechnung, e-invoice, en 16931, peppol
 **Support:** hello@wsystem.dev, https://wsystem.dev/shopify-xrechnung
 **Privacy policy:** https://wsystem.dev/privacy   **Terms:** https://wsystem.dev/terms
@@ -42,7 +42,7 @@ W System E-Rechnung erstellt zu jeder Bestellung eine strukturierte E-Rechnung u
 - Leitweg-ID je Bestellung für öffentliche Auftraggeber
 - Ohne Konto nutzbar (20 Rechnungen pro Tag); kostenloser API-Schlüssel mit 500 Einheiten im Monat
 - Deutsch und Englisch
-**Preis:** Kostenlose App. W System API: 20 Rechnungen pro Tag ohne Schlüssel; kostenloser Schlüssel mit 500 Einheiten im Monat (8 Einheiten pro Rechnung); bezahlte Tarife unter https://wsystem.dev/pricing (Abrechnung durch W System, nicht über Shopify).
+**Preis:** Kostenlos: 25 E-Rechnungen im Monat. Shop: 12 € im Monat für 150. Shop Plus: 29 € im Monat für 750. Shop Pro: 59 € im Monat für 2.000. Jahreszahlung: 10 Monate zahlen, 12 erhalten (120 €, 290 €, 590 € pro Jahr). Gleicher Preis in jedem Shop. Abrechnung über Shopify.
 **Grenzen:** keine ZUGFeRD-PDFs, noch keine Gutschriften für Erstattungen, keine Trinkgelder oder Geschenkgutscheine; keine Steuer- oder Rechtsberatung.
 
 ## Fees, contracts and review requirements (for Zifeng; fees checked on shopify.dev 21 Nov 2026)
