@@ -133,4 +133,4 @@ Dev store for our own demo (read only for reviewers, optional): https://wsystem-
 
 ## Feature image
 File: listing/feature-1600x900.png (no pricing text; previous version kept as feature-1600x900.orig.png).
-Alt text (53 chars): "W System E-Invoice app showing recent XRechnung orders"
+Alt text (54 chars): "W System E-Invoice app showing recent XRechnung orders"
