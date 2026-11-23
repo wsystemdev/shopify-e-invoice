@@ -10,7 +10,7 @@ const json = (o, status = 200) => new Response(JSON.stringify(o), { status, head
 // plan id (quota in units on the shop's own key). Hosted plan page: https://admin.shopify.com/store/<shop handle>/charges/<APP_HANDLE>/pricing_plans.
 // BILLING_PLANS (JSON array) overrides this list; "[]" hides the plan table.
 export const DEFAULT_PLANS = [
-  { id: "free", handle: "free", ws: "shop_free", name: "Free", invoices: 25, price: "0.00", yearly: "0.00", currency: "USD" },
+  { id: "free", handle: "free", ws: "shop_free", name: "Free", invoices: 50, price: "0.00", yearly: "0.00", currency: "USD" },
   { id: "shop", handle: "shop", ws: "shop", name: "Shop", invoices: 150, price: "13.00", yearly: "130.00", currency: "USD" },
   { id: "shop_plus", handle: "shop-plus", ws: "shop_plus", name: "Shop Plus", invoices: 750, price: "32.00", yearly: "320.00", currency: "USD" },
   { id: "shop_pro", handle: "shop-pro", ws: "shop_pro", name: "Shop Pro", invoices: 2000, price: "65.00", yearly: "650.00", currency: "USD" },

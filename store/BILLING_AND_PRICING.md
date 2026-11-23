@@ -3,7 +3,7 @@
 ## Plans (Shopify managed App Pricing, created in the Partner Dashboard pricing page; one plan carries monthly and yearly prices)
 | Plan name | Handle | Monthly (USD) | Yearly (pay 10, get 12) | Invoices/month | W System plan (units/month) |
 |---|---|---|---|---|---|
-| Free | `free` | $0 | none | 25 | shop_free (300) |
+| Free | `free` | $0 | none | 50 | shop_free (600) |
 | Shop | `shop` | $13 | $130 | 150 | shop (1,800) |
 | Shop Plus | `shop-plus` | $32 | $320 | 750 | shop_plus (9,000) |
 | Shop Pro | `shop-pro` | $65 | $650 | 2,000 | shop_pro (24,000) |

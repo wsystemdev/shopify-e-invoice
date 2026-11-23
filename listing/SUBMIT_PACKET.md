@@ -61,9 +61,9 @@ W System E-Invoice creates a structured e-invoice for each order and checks it b
 - Download link on the order (tag and metafield) and a list of recent invoices in the app
 - Several VAT rates, discounts, shipping, bank transfer with IBAN, intra-EU reverse charge, exports, small business scheme (section 19 UStG)
 - Leitweg-ID per order for public-sector buyers
-- Free for 25 invoices a month, then from $13 a month (billed through Shopify). Your W System key is set up automatically
+- Free for 50 invoices a month, then from $13 a month (billed through Shopify). Your W System key is set up automatically
 - English and German
-**Pricing:** Free: 25 e-invoices a month. Shop: $13 a month for 150. Shop Plus: $32 a month for 750. Shop Pro: $65 a month for 2,000. Annual billing: pay 10 months, get 12 ($130, $320, $650 a year). Same price in every store. Billed through Shopify in USD.
+**Pricing:** Free: 50 e-invoices a month. Shop: $13 a month for 150. Shop Plus: $32 a month for 750. Shop Pro: $65 a month for 2,000. Annual billing: pay 10 months, get 12 ($130, $320, $650 a year). Same price in every store. Billed through Shopify in USD.
 **Search terms:** xrechnung, e-rechnung, e-invoice, en 16931, peppol
 **Support:** hello@wsystem.dev, https://wsystem.dev/support
 **Privacy policy:** https://wsystem.dev/privacy   **Terms:** https://wsystem.dev/terms
@@ -87,7 +87,7 @@ W System E-Rechnung erstellt zu jeder Bestellung eine strukturierte E-Rechnung u
 - Leitweg-ID je Bestellung für öffentliche Auftraggeber
 - Ohne Konto nutzbar (20 Rechnungen pro Tag); kostenloser API-Schlüssel mit 500 Einheiten im Monat
 - Deutsch und Englisch
-**Preis:** Kostenlos: 25 E-Rechnungen im Monat. Shop: 13 $ im Monat für 150. Shop Plus: 32 $ im Monat für 750. Shop Pro: 65 $ im Monat für 2.000. Jahreszahlung: 10 Monate zahlen, 12 erhalten (130 $, 320 $, 650 $ pro Jahr). Gleicher Preis in jedem Shop. Abrechnung über Shopify in USD.
+**Preis:** Kostenlos: 50 E-Rechnungen im Monat. Shop: 13 $ im Monat für 150. Shop Plus: 32 $ im Monat für 750. Shop Pro: 65 $ im Monat für 2.000. Jahreszahlung: 10 Monate zahlen, 12 erhalten (130 $, 320 $, 650 $ pro Jahr). Gleicher Preis in jedem Shop. Abrechnung über Shopify in USD.
 **Grenzen:** keine ZUGFeRD-PDFs, noch keine Gutschriften für Erstattungen, keine Trinkgelder oder Geschenkgutscheine; keine Steuer- oder Rechtsberatung.
 
 
@@ -103,7 +103,7 @@ Alt texts: 1 "App settings with seller data and format", 2 "Recent e-invoices wi
 ## 4. Pricing (same price in every store; Shopify bills in USD: $13/$32/$65 monthly, $130/$320/$650 yearly; set in the listing's Pricing section, using Shopify managed App Pricing: create the 4 plans in the Partner Dashboard pricing page, each monthly + yearly on one plan; handles free, shop, shop-plus, shop-pro; redirect URL /)
 | Plan | Monthly (USD) | Annual (USD, 10 months for 12) | Included invoices per month |
 |---|---|---|---|
-| Free | 0 | n/a | 25 |
+| Free | 0 | n/a | 50 |
 | Shop | 13.00 | 130.00 | 150 |
 | Shop Plus | 32.00 | 320.00 | 750 |
 | Shop Pro | 65.00 | 650.00 | 2,000 |
