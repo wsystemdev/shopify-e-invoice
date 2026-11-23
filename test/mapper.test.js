@@ -57,3 +57,43 @@ test("parseResult flags total mismatch and maps errors", () => {
   const r = parseResult({ valid: false, errors: [{ rule_id: "BR-DE-2", explain: { what: "x", fix: "y" } }], totals: { total_with_vat: 118.99 }, xml: "<a/>" }, "119.00");
   assert.equal(r.valid, false); assert.equal(r.errors[0].fix, "y"); assert.match(r.mismatch, /differs/);
 });
+
+// ---- B253: ZUGFeRD option + credit notes (both OFF by default) ----
+import { buildCreditNote, DEFAULT_SETTINGS } from "../src/mapper.js";
+const o2 = () => order({ financial_status: "partially_refunded", processed_at: "2026-11-20T12:00:00Z",
+  line_items: [{ id: 11, title: "Widget", variant_title: "Blue", sku: "W1", quantity: 2, price: "119.00", total_discount: "0.00", tax_lines: [{ price: "38.00", rate: 0.19 }] },
+               { id: 12, title: "Book", quantity: 1, price: "10.70", total_discount: "0.00", tax_lines: [{ price: "0.70", rate: 0.07 }] }],
+  shipping_lines: [{ title: "DHL", price: "5.95", discounted_price: "5.95", tax_lines: [{ price: "0.95", rate: 0.19 }] }] });
+const refund = { id: 9000123, order_id: 1, created_at: "2026-11-22T09:00:00Z",
+  refund_line_items: [{ line_item_id: 11, quantity: 1, subtotal: 119.0, total_tax: 19.0 }, { line_item_id: 12, quantity: 1, subtotal: 10.7, total_tax: 0.7 }],
+  order_adjustments: [{ kind: "shipping_refund", amount: "-5.00", tax_amount: "-0.95" }] };
+
+test("defaults: zugferd and credit_notes are off; format unchanged", () => {
+  assert.equal(DEFAULT_SETTINGS.zugferd, "no"); assert.equal(DEFAULT_SETTINGS.credit_notes, "no");
+  assert.equal(buildInvoice(order(), S).format, "xrechnung");
+  assert.equal(buildInvoice(order(), { ...S, format: "en16931" }).format, "en16931");
+});
+test("zugferd=yes switches format to zugferd (not for peppol-bis3)", () => {
+  assert.equal(buildInvoice(order(), { ...S, zugferd: "yes" }).format, "zugferd");
+  assert.equal(buildInvoice(order(), { ...S, zugferd: "yes", format: "peppol-bis3" }).format, "peppol-bis3");
+});
+test("credit note: 381, references original, refunded items + shipping at original rates, positive amounts, no prepaid", () => {
+  const b = buildCreditNote(o2(), refund, S, { today: "2026-11-22", precedingNumber: "1001", precedingDate: "2026-11-20" });
+  assert.equal(b.type_code, "381"); assert.equal(b.preceding_invoice, "1001"); assert.equal(b.preceding_invoice_date, "2026-11-20");
+  assert.equal(b.invoice_number, "CN-1001-000123"); assert.equal(b.issue_date, "2026-11-22"); assert.equal(b.prepaid_amount, undefined);
+  assert.equal(b.lines.length, 3);
+  assert.deepEqual(b.lines.map((l) => [l.unit_price, l.quantity, l.vat_rate, l.vat_category]), [[100, 1, 19, "S"], [10, 1, 7, "S"], [5, 1, 19, "S"]]);
+  assert.match(b.lines[0].description, /Widget \(Blue\)/); assert.match(b.lines[2].description, /Shipping/);
+});
+test("credit note: tax-exclusive shop, small business and unknown line skipped", () => {
+  const o = o2(); o.taxes_included = false;
+  const r = { ...refund, refund_line_items: [{ line_item_id: 11, quantity: 1, subtotal: 100.0, total_tax: 19.0 }, { line_item_id: 999, quantity: 1, subtotal: 5, total_tax: 0 }], order_adjustments: [] };
+  const b = buildCreditNote(o, r, S);
+  assert.equal(b.lines.length, 1); assert.equal(b.lines[0].unit_price, 100); assert.equal(b.lines[0].vat_rate, 19);
+  const k = buildCreditNote(o, r, { ...S, small_business: "yes" });
+  assert.equal(k.lines[0].vat_category, "E"); assert.equal(k.lines[0].vat_rate, 0); assert.ok(k.vat_exemption_reason.E);
+});
+test("credit note payment: IBAN set -> means 58 with IBAN (BR-61); no IBAN -> means 1", () => {
+  const w = buildCreditNote(o2(), refund, { ...S, seller_iban: "DE02 1203 0000 0000 2020 51" }); assert.equal(w.payment.means_code, "58"); assert.equal(w.payment.iban, "DE02120300000000202051");
+  const n = buildCreditNote(o2(), refund, { ...S, seller_iban: "" }); assert.equal(n.payment.means_code, "1"); assert.equal(n.payment.iban, undefined);
+});

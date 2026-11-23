@@ -1,4 +1,4 @@
-import { buildInvoice, parseResult, isB2B, DEFAULT_SETTINGS, orderNumber } from "./mapper.js";
+import { buildInvoice, buildCreditNote, parseResult, isB2B, DEFAULT_SETTINGS, orderNumber } from "./mapper.js";
 import { hmac, safeEq, seal, unseal, verifySessionToken } from "./crypto.js";
 import { adminPage } from "./admin.js";
 
@@ -112,7 +112,7 @@ const TAXL = `taxLines { rate priceSet ${MONEY} }`;
 const ORDER_FIELDS = `legacyResourceId name createdAt processedAt displayFinancialStatus taxesIncluded currencyCode presentmentCurrencyCode email tags paymentGatewayNames
   currentTotalPriceSet ${MONEY} totalPriceSet ${MONEY} customAttributes { key value }
   billingAddress ${ADDR} shippingAddress ${ADDR}
-  lineItems(first: 100) { nodes { title variantTitle sku quantity originalUnitPriceSet ${MONEY} totalDiscountSet ${MONEY} ${TAXL} } }
+  lineItems(first: 100) { nodes { id title variantTitle sku quantity originalUnitPriceSet ${MONEY} totalDiscountSet ${MONEY} ${TAXL} } }
   shippingLines(first: 10) { nodes { title originalPriceSet ${MONEY} discountedPriceSet ${MONEY} ${TAXL} } }`;
 // Convert a GraphQL order into the REST-style shape that the mapper (and the webhook payload) use.
 export function gqlOrderToRest(o) {
@@ -128,7 +128,7 @@ export function gqlOrderToRest(o) {
     current_total_price: amt(o.currentTotalPriceSet), total_price: amt(o.totalPriceSet),
     note_attributes: (o.customAttributes || []).map((a) => ({ name: a.key, value: a.value })),
     billing_address: addr(o.billingAddress), shipping_address: addr(o.shippingAddress),
-    line_items: ((o.lineItems && o.lineItems.nodes) || []).map((x) => ({ title: x.title, variant_title: x.variantTitle || "", sku: x.sku || "", quantity: x.quantity, price: amt(x.originalUnitPriceSet), total_discount: amt(x.totalDiscountSet), tax_lines: tl(x) })),
+    line_items: ((o.lineItems && o.lineItems.nodes) || []).map((x) => ({ id: String(x.id || "").split("/").pop(), title: x.title, variant_title: x.variantTitle || "", sku: x.sku || "", quantity: x.quantity, price: amt(x.originalUnitPriceSet), total_discount: amt(x.totalDiscountSet), tax_lines: tl(x) })),
     shipping_lines: ((o.shippingLines && o.shippingLines.nodes) || []).map((x) => ({ title: x.title, price: amt(x.originalPriceSet), discounted_price: amt(x.discountedPriceSet), tax_lines: tl(x) })),
   };
 }
@@ -244,6 +244,7 @@ export async function generate(env, shop, order, shopData, { force = false, f = 
   } else {
     const p = parseResult(data, order.current_total_price ?? order.total_price);
     rec = { order: orderNumber(order), number: body.invoice_number, format: body.format, valid: p.valid, xml: p.valid ? p.xml : "", errors: p.errors, mismatch: p.mismatch, created: new Date().toISOString() };
+    if (p.valid && body.format === "zugferd" && data.pdf_base64) rec.pdf = data.pdf_base64; // B253: ZUGFeRD / Factur-X PDF (only when the shop turned it on)
   }
   // A failed attempt never replaces an earlier valid invoice (or its tag): the failure is stored next to it.
   let kept = false;
@@ -291,6 +292,49 @@ async function onOrderWebhook(env, req, body, topic) {
   await generate(env, shop, order, sd);
 }
 
+// B253: credit note for a refund. Does nothing unless the shop turned "credit_notes" on, and only for orders that already have a valid e-invoice.
+export async function createCreditNote(env, shop, sd, refund, order, { f = fetch } = {}) {
+  const key = `inv:${shop}:cn-${refund.id}`;
+  if (await env.STORE.get(key)) return { skipped: "exists" };
+  const orig = await env.STORE.get(`inv:${shop}:${order.id}`, "json");
+  if (!orig || !orig.valid) return { skipped: "no_original_invoice" };
+  const s = sd.settings;
+  const body = buildCreditNote(order, refund, s, { precedingNumber: orig.number, precedingDate: String(orig.created || "").slice(0, 10) || undefined });
+  if (!body.lines.length) return { skipped: "no_lines" };
+  if (s.zugferd === "yes" && s.format !== "peppol-bis3") body.format = "zugferd";
+  const headers = { "content-type": "application/json", "user-agent": "w-system-e-invoice-shopify/1.0" };
+  if (s.api_key) headers["x-api-key"] = s.api_key;
+  let res, data;
+  try { res = await f(`${env.API_BASE || "https://api.wsystem.dev"}/einvoice/create`, { method: "POST", headers, body: JSON.stringify(body) }); data = await res.json(); } catch (e) { data = null; }
+  let rec;
+  if (!res || !res.ok || !data) {
+    const msg = data && (data.detail || data.error) ? JSON.stringify(data.detail || data.error).slice(0, 300) : `API error ${res ? res.status : "unreachable"}`;
+    rec = { kind: "credit_note", order: orderNumber(order), number: body.invoice_number, original: orig.number, valid: false, xml: "", errors: [{ rule_id: "API", message: msg, fix: "" }], created: new Date().toISOString() };
+  } else {
+    const p = parseResult(data, 0);
+    rec = { kind: "credit_note", order: orderNumber(order), number: body.invoice_number, original: orig.number, format: body.format, valid: p.valid, xml: p.valid ? p.xml : "", errors: p.errors, created: new Date().toISOString() };
+    if (p.valid && body.format === "zugferd" && data.pdf_base64) rec.pdf = data.pdf_base64;
+  }
+  await env.STORE.put(key, JSON.stringify(rec), { expirationTtl: TTL, metadata: { order: rec.order, number: rec.number, valid: rec.valid, created: rec.created } });
+  await idxUpdate(env, shop, `cn-${refund.id}`, { order: rec.order, number: rec.number, valid: rec.valid, created: rec.created, xml: !!rec.xml, errors: (rec.errors || []).slice(0, 2), kind: "credit_note" });
+  await audit(env, shop, "credit_note", refund.id);
+  return rec;
+}
+
+async function onRefundWebhook(env, req, body) {
+  const shop = (req.headers.get("x-shopify-shop-domain") || "").toLowerCase();
+  if (!SHOP_RE.test(shop)) return;
+  const sd = await getShop(env, shop);
+  if (!sd || sd.settings.credit_notes !== "yes" || sd.settings.trigger === "off") return;
+  const refund = JSON.parse(body);
+  if (!refund || !refund.id || !refund.order_id) return;
+  await ensureAccess(env, shop, sd);
+  if (!sd.token) return;
+  const order = await findOrder(env, shop, sd.token, String(refund.order_id));
+  if (!order) return;
+  await createCreditNote(env, shop, sd, refund, order);
+}
+
 async function onCompliance(env, body) {
   const p = JSON.parse(body);
   const shop = String(p.shop_domain || "").toLowerCase();
@@ -331,6 +375,7 @@ export default {
         const topicHdr = (req.headers.get("x-shopify-topic") || "").toLowerCase();
         if (path === "/webhooks/orders-create") ctx.waitUntil(onOrderWebhook(env, req, body, "create"));
         else if (path === "/webhooks/orders-paid") ctx.waitUntil(onOrderWebhook(env, req, body, "paid"));
+        else if (path === "/webhooks/refunds-create") ctx.waitUntil(onRefundWebhook(env, req, body)); // B253: not subscribed until the app version with this topic is approved
         else if (path === "/webhooks/app-subscriptions") {
           const shop = (req.headers.get("x-shopify-shop-domain") || "").toLowerCase();
           if (SHOP_RE.test(shop)) ctx.waitUntil((async () => { const sd = await getShop(env, shop); if (sd) { await ensureAccess(env, shop, sd); await syncBilling(env, shop, (await getShop(env, shop)) || sd); } })());
@@ -353,10 +398,15 @@ export default {
       if (path.startsWith("/d/")) {
         const [, , shop, id] = path.split("/");
         const t = url.searchParams.get("t") || "";
-        if (!SHOP_RE.test(shop || "") || !/^\d+$/.test(id || "") || !safeEq((await hmac(env.ENC_KEY, `dl|${shop}|${id}`)).slice(0, 32), t)) return new Response("not found", { status: 404 });
+        if (!SHOP_RE.test(shop || "") || !/^(cn-)?\d+$/.test(id || "") || !safeEq((await hmac(env.ENC_KEY, `dl|${shop}|${id}`)).slice(0, 32), t)) return new Response("not found", { status: 404 });
         const rec = await env.STORE.get(`inv:${shop}:${id}`, "json");
         if (!rec || !rec.valid || !rec.xml) return new Response("not found", { status: 404 });
         await audit(env, shop, "download", id);
+        if (url.searchParams.get("f") === "pdf") {
+          if (!rec.pdf) return new Response("not found", { status: 404 });
+          const bin = Uint8Array.from(atob(rec.pdf), (c) => c.charCodeAt(0));
+          return new Response(bin, { headers: { "content-type": "application/pdf", "content-disposition": `attachment; filename="${String(rec.number).replace(/[^\w.-]/g, "_")}.pdf"`, "cache-control": "no-store" } });
+        }
         return new Response(rec.xml, { headers: { "content-type": "application/xml; charset=utf-8", "content-disposition": `attachment; filename="${String(rec.number).replace(/[^\w.-]/g, "_")}.xml"`, "cache-control": "no-store" } });
       }
 
@@ -383,6 +433,7 @@ export default {
           }
           if (!["xrechnung", "en16931", "peppol-bis3"].includes(s.format)) s.format = "xrechnung";
           if (!["paid", "created", "off"].includes(s.trigger)) s.trigger = "paid";
+          for (const k of ["zugferd", "credit_notes"]) if (s[k] !== "yes") s[k] = "no";
           await putShop(env, shop, { ...sd, settings: s });
           let webhooks = [];
           try { webhooks = await ensureWebhooks(env, shop, sd.token); } catch (e) { /* best effort */ }

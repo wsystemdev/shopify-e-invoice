@@ -295,3 +295,66 @@ test("failed regeneration keeps the earlier valid invoice and tag, stores lastEr
     const f = await generate(e, SHOP, ORDER, sd, { force: true, f: quota }); assert.equal(f.valid, false); assert.ok(gql.some((b) => b.includes("e-invoice-failed")));
   } finally { globalThis.fetch = orig; }
 });
+
+// ---- B253: ZUGFeRD + credit notes, per-shop opt-in ----
+const REFUND = { id: 555000111, order_id: 77, created_at: "2026-11-22T09:00:00Z", refund_line_items: [{ line_item_id: 5, quantity: 1, subtotal: 119, total_tax: 19 }], order_adjustments: [] };
+const ORDER_ID = { ...ORDER, line_items: [{ id: 5, title: "W", quantity: 1, price: "119", total_discount: "0", tax_lines: [{ price: "19", rate: 0.19 }] }] };
+const apiOk = (extra = {}) => async (u, i) => String(u).includes("api.test") ? new Response(JSON.stringify({ valid: true, xml: "<CreditNote/>", errors: [], ...extra })) : new Response(JSON.stringify({ data: {} }));
+
+test("zugferd off (default): create sends the shop's format and stores no pdf", async () => {
+  const e = env(); await seedShop(e); let sent;
+  const f = async (u, i) => { sent = JSON.parse(i.body); return apiOk({ pdf_base64: "JVBERi0x" })(u, i); };
+  const rec = await generate(e, SHOP, ORDER_ID, JSON.parse(await e.STORE.get(`shop:${SHOP}`)).settings ? { settings: { trigger: "paid" } } : null, { f });
+  assert.equal(sent.format, "xrechnung"); assert.equal(rec.pdf, undefined);
+});
+test("zugferd on: format zugferd, pdf stored and downloadable with ?f=pdf", async () => {
+  const e = env(); await seedShop(e, { zugferd: "yes" }); let sent; const orig = globalThis.fetch;
+  globalThis.fetch = async (u, i) => { if (String(u).includes("api.test")) sent = JSON.parse(i.body); return apiOk({ xml: "<rsm:CrossIndustryInvoice/>", pdf_base64: btoa("%PDF-1.7 x"), embedded_file: "factur-x.xml" })(u, i); };
+  try { assert.equal((await wh(e, "/webhooks/orders-paid", ORDER_ID, "orders/paid")).status, 200); } finally { globalThis.fetch = orig; }
+  assert.equal(sent.format, "zugferd");
+  const rec = await e.STORE.get(`inv:${SHOP}:77`, "json"); assert.equal(rec.valid, true); assert.ok(rec.pdf);
+  const t = (await hmac(e.ENC_KEY, `dl|${SHOP}|77`)).slice(0, 32);
+  const dl = await app.fetch(new Request(`https://app.example/d/${SHOP}/77?t=${t}&f=pdf`), e, ctx());
+  assert.equal(dl.status, 200); assert.equal(dl.headers.get("content-type"), "application/pdf"); assert.equal(await dl.text(), "%PDF-1.7 x");
+  const xml = await app.fetch(new Request(`https://app.example/d/${SHOP}/77?t=${t}`), e, ctx()); assert.match(xml.headers.get("content-type"), /xml/);
+});
+test("settings POST coerces zugferd / credit_notes to yes|no", async () => {
+  const e = env(); await seedShop(e);
+  const post = async (d) => app.fetch(new Request("https://app.example/api/settings", { method: "POST", body: JSON.stringify(d), headers: { authorization: "Bearer " + await jwt(claims()), "content-type": "application/json" } }), e, ctx());
+  assert.equal((await post({ zugferd: "maybe", credit_notes: "yes" })).status, 200);
+  const sd = JSON.parse(await e.STORE.get(`shop:${SHOP}`)); // sealed? settings may be sealed: read through the API instead
+  const g = await app.fetch(new Request("https://app.example/api/settings", { headers: { authorization: "Bearer " + await jwt(claims()) } }), e, ctx());
+  const s = (await g.json()).settings; assert.equal(s.zugferd, "no"); assert.equal(s.credit_notes, "yes"); void sd;
+});
+test("refunds/create: ignored while credit_notes is off (default): no API call, no record", async () => {
+  const e = env(); await seedShop(e); await e.STORE.put(`inv:${SHOP}:77`, JSON.stringify({ valid: true, number: "1002", xml: "<Invoice/>", created: "2026-11-20T10:00:00Z" })); const calls = []; const orig = globalThis.fetch;
+  globalThis.fetch = async (u, i) => { calls.push(String(u)); return apiOk()(u, i); };
+  try { assert.equal((await wh(e, "/webhooks/refunds-create", REFUND, "refunds/create")).status, 200); } finally { globalThis.fetch = orig; }
+  assert.equal(calls.length, 0); assert.equal(await e.STORE.get(`inv:${SHOP}:cn-${REFUND.id}`), null);
+});
+test("refunds/create with credit_notes on: credit note 381 referencing the original, stored, idempotent, downloadable", async () => {
+  const e = env(); await seedShop(e, { credit_notes: "yes", zugferd: "yes" });
+  await e.STORE.put(`inv:${SHOP}:77`, JSON.stringify({ valid: true, number: "1002", xml: "<Invoice/>", created: "2026-11-20T10:00:00Z" }));
+  const sent = []; const orig = globalThis.fetch;
+  const GQ = { ...GQL_ORDER, lineItems: { nodes: [{ id: "gid://shopify/LineItem/5", title: "W", variantTitle: "", sku: "", quantity: 1, originalUnitPriceSet: { shopMoney: { amount: "119" } }, totalDiscountSet: { shopMoney: { amount: "0" } }, taxLines: [{ rate: 0.19, priceSet: { shopMoney: { amount: "19" } } }] }] } };
+  globalThis.fetch = async (u, i) => {
+    if (String(u).includes("api.test")) { sent.push(JSON.parse(i.body)); return apiOk({ xml: "<rsm:CrossIndustryInvoice/>", pdf_base64: btoa("%PDF cn") })(u, i); }
+    if (String(u).includes("graphql.json")) return new Response(JSON.stringify({ data: { orders: { nodes: [GQ] } } }));
+    return new Response("{}");
+  };
+  try {
+    assert.equal((await wh(e, "/webhooks/refunds-create", REFUND, "refunds/create")).status, 200);
+    assert.equal((await wh(e, "/webhooks/refunds-create", REFUND, "refunds/create")).status, 200); // replay
+  } finally { globalThis.fetch = orig; }
+  assert.equal(sent.length, 1); assert.equal(sent[0].type_code, "381"); assert.equal(sent[0].preceding_invoice, "1002"); assert.equal(sent[0].preceding_invoice_date, "2026-11-20"); assert.equal(sent[0].format, "zugferd");
+  assert.equal(sent[0].lines[0].unit_price, 100);
+  const rec = await e.STORE.get(`inv:${SHOP}:cn-${REFUND.id}`, "json"); assert.equal(rec.kind, "credit_note"); assert.equal(rec.valid, true); assert.equal(rec.original, "1002"); assert.ok(rec.pdf);
+  const t = (await hmac(e.ENC_KEY, `dl|${SHOP}|cn-${REFUND.id}`)).slice(0, 32);
+  assert.equal((await app.fetch(new Request(`https://app.example/d/${SHOP}/cn-${REFUND.id}?t=${t}&f=pdf`), e, ctx())).status, 200);
+});
+test("refunds/create without an original valid e-invoice creates no credit note", async () => {
+  const e = env(); await seedShop(e, { credit_notes: "yes" }); const orig = globalThis.fetch; const calls = [];
+  globalThis.fetch = async (u, i) => { calls.push(String(u)); return apiOk()(u, i); };
+  try { await wh(e, "/webhooks/refunds-create", REFUND, "refunds/create"); } finally { globalThis.fetch = orig; }
+  assert.equal(calls.filter((c) => c.includes("api.test")).length, 0); assert.equal(await e.STORE.get(`inv:${SHOP}:cn-${REFUND.id}`), null);
+});

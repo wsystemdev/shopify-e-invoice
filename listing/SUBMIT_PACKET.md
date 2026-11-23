@@ -1,4 +1,5 @@
-# Shopify App Store submit packet: W System E-Invoice (READY, NOT SUBMITTED)
+# Shopify App Store submit packet: W System E-Invoice (SUBMITTED to the Shopify App Store on 22 Nov 2026 at 06:29, in review)
+Status: this packet was submitted on 22 Nov 2026 06:29 (Europe/Budapest) and is in review. Do not edit the listing, app config or webhooks while it is in review. Planned follow-ups (ZUGFeRD PDF, credit notes) wait in `POST_APPROVAL_ZUGFERD_CREDIT_NOTES.md`.
 For Browser Ops. Paste text exactly; do not edit prices. Public name everywhere: **W System**. Never show zifengw@. Never paste secrets.
 
 ## 0. Before you start

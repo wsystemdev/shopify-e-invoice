@@ -10,6 +10,7 @@ export const DEFAULT_SETTINGS = {
   seller_email: "", seller_phone: "", seller_contact: "", seller_vat_id: "", seller_tax_no: "", seller_reg_no: "",
   seller_iban: "", seller_bic: "", payment_terms: "", default_buyer_reference: "", vat_attr_names: "vat_id, vat id, vat, ust-idnr, ust-id, ustidnr, tax_id",
   invoice_prefix: "", email_copy: "no",
+  zugferd: "no", credit_notes: "no", // B253: beta options, OFF unless the merchant turns them on
 };
 
 export function buyerVat(order, s) {
@@ -56,6 +57,17 @@ function line(desc, qty, net, v, sku) {
 
 const berlinDate = (d = new Date()) => new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Berlin" }).format(d);
 
+export function zeroCat(order, set) {
+  const sc = String(set.seller_country || "DE").toUpperCase();
+  const ba = order.billing_address || order.shipping_address || {};
+  const bc = String(ba.country_code || "").toUpperCase();
+  const bvat = buyerVat(order, set);
+  if (set.small_business === "yes") return "E";
+  if (bc && bc !== sc && !EU.includes(bc)) return "G";
+  if (bvat && bc !== sc && EU.includes(bc)) return "AE";
+  return "Z";
+}
+
 export function buildInvoice(order, s, opts = {}) {
   const set = { ...DEFAULT_SETTINGS, ...s };
   const sc = String(set.seller_country || "DE").toUpperCase();
@@ -64,10 +76,7 @@ export function buildInvoice(order, s, opts = {}) {
   const bvat = buyerVat(order, set);
   const small = set.small_business === "yes";
   const includes = !!order.taxes_included;
-  let zero = "Z";
-  if (small) zero = "E";
-  else if (bc && bc !== sc && !EU.includes(bc)) zero = "G";
-  else if (bvat && bc !== sc && EU.includes(bc)) zero = "AE";
+  const zero = zeroCat(order, set);
 
   const lines = [];
   for (const it of order.line_items || []) {
@@ -126,7 +135,7 @@ export function buildInvoice(order, s, opts = {}) {
   const strip = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== "" && v != null));
   const today = opts.today || berlinDate();
   const body = {
-    format: opts.format || set.format,
+    format: opts.format || (set.zugferd === "yes" && set.format !== "peppol-bis3" ? "zugferd" : set.format),
     invoice_number: number,
     issue_date: today,
     delivery_date: String(order.processed_at || order.created_at || "").slice(0, 10) || today,
@@ -150,4 +159,50 @@ export function parseResult(d, orderTotal) {
     mismatch = `The e-invoice total (${totals.total_with_vat}) differs from the order total (${orderTotal}), usually by rounding or tips/gift cards.`;
   }
   return { valid: !!d.valid, xml: d.xml || "", errors, totals, mismatch };
+}
+
+// ---- B253: credit note for a Shopify refund (refunds/create payload) -> POST /einvoice/create, type_code 381 ----
+// Only used when the shop turned "credit_notes" on. `refund` = the refunds/create webhook JSON, `order` = the original order (REST shape,
+// line_items need `id`). Amounts stay positive (EN 16931 credit note). Lines = refunded items + refunded shipping, taxed at the original rates.
+export function buildCreditNote(order, refund, s, opts = {}) {
+  const set = { ...DEFAULT_SETTINGS, ...s };
+  const base = buildInvoice(order, set, opts);
+  const includes = !!order.taxes_included;
+  const zero = zeroCat(order, set);
+  const lines = [];
+  for (const rl of refund.refund_line_items || []) {
+    const it = (order.line_items || []).find((x) => String(x.id) === String(rl.line_item_id || (rl.line_item && rl.line_item.id)));
+    if (!it) continue;
+    const qty = n(rl.quantity);
+    if (qty <= 0) continue;
+    const rate = (it.tax_lines || []).reduce((a, t) => a + n(t.rate), 0);
+    const gross = n(rl.subtotal);                      // refunded amount of this line (tax-inclusive when the shop shows prices with tax)
+    const t = taxInfo({ tax_lines: [{ rate, price: n(rl.total_tax) }] }, includes, gross, zero);
+    lines.push(line(it.title + (it.variant_title ? ` (${it.variant_title})` : ""), qty, t.net, t, it.sku));
+  }
+  for (const a of refund.order_adjustments || []) {
+    if (a.kind !== "shipping_refund") continue;
+    const gross = Math.abs(n(a.amount)) , tax = Math.abs(n(a.tax_amount));
+    if (r2(gross) === 0) continue;
+    const ship = (order.shipping_lines || [])[0] || {};
+    const rate = (ship.tax_lines || []).reduce((x, t) => x + n(t.rate), 0);
+    // shipping_refund.amount is tax-exclusive in Shopify's payload; add the tax back when the shop shows prices with tax so taxInfo can split it
+    const t = taxInfo({ tax_lines: [{ rate, price: tax }] }, includes, includes ? gross + tax : gross, zero);
+    lines.push(line("Shipping (refund)", 1, t.net, t));
+  }
+  if (set.small_business === "yes") for (const l of lines) { l.vat_category = "E"; l.vat_rate = 0; }
+  const body = { ...base, lines };
+  delete body.prepaid_amount;
+  const orig = base.invoice_number;
+  body.invoice_number = `${set.invoice_prefix || ""}CN-${orderNumber(order)}-${String(refund.id || "").slice(-6)}`;
+  body.type_code = "381";
+  body.preceding_invoice = opts.precedingNumber || orig;
+  body.preceding_invoice_date = opts.precedingDate || String(order.processed_at || order.created_at || "").slice(0, 10) || base.issue_date;
+  body.issue_date = opts.today || berlinDate();
+  body.delivery_date = String(refund.created_at || "").slice(0, 10) || body.issue_date;
+  const iban = String(set.seller_iban || "").replace(/\s/g, "");  // BR-61: means 58 needs an account; otherwise "1" (not defined)
+  body.payment = iban ? { means_code: "58", iban, account_name: set.seller_name, reference: body.invoice_number, terms: "Refund to the original payment method" }
+    : { means_code: "1", reference: body.invoice_number, terms: "Refund to the original payment method" };
+  if (set.small_business === "yes") body.vat_exemption_reason = { E: "No VAT charged under the small business scheme (section 19 UStG)." };
+  return body;
 }

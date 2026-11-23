@@ -33,7 +33,11 @@ shopify app deploy
 ```
 Protected customer data: the app reads customer name, address and email from orders. Request protected customer data access (levels 1 and 2) in the Partner Dashboard.
 
+## Beta options (both OFF by default)
+- `zugferd` = yes: the app asks the W System API for `format: zugferd` (ZUGFeRD 2.3 / Factur-X EN 16931, PDF/A-3b with the XML embedded) instead of XML only. The PDF is stored with the invoice and downloads with `?f=pdf` on the invoice link. Not available together with the Peppol BIS format. Shown in the settings page as a Yes/No select.
+- `credit_notes` = yes: a `refunds/create` webhook creates a credit note (type 381, referencing the original invoice number and date, refunded items and shipping at the original VAT rates). Only for orders that already have a valid e-invoice. The Worker code is in place (`POST /webhooks/refunds-create`), but the webhook topic is not subscribed until the app version that adds it is approved, so the setting has no effect yet and has no settings-page control yet. See `listing/POST_APPROVAL_ZUGFERD_CREDIT_NOTES.md`.
+
 ## Not included
-No ZUGFeRD PDF, no credit notes for refunds, no tips or gift-card handling. Not tax or legal advice.
+No tips or gift-card handling; credit notes are not live yet (see above). Not tax or legal advice.
 
 MIT licence. Operated by W System, https://wsystem.dev.
