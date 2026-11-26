@@ -3,6 +3,7 @@
 ## 1.0.3
 
 - When Shopify leaves `tax_lines` at the tax on the undiscounted price (the line or order tax matches tax on the original price, not on the discounted price), net is recomputed from the discounted gross at the line's rate(s). `tax_lines` that are already post-discount are left unchanged, so Shopify's charged VAT is still used for reconcile / `vat_amounts`.
+- Post-discount stacked taxes (e.g. 6 % + 1 % on the same discounted net) are no longer mis-detected as pre-discount / split, which had sent a tax-excluded 189.85 order out as 183.65 (payable −6.20).
 - A paid discounted order then has payable 0.00, including the real #1016 shape (pre-discount `tax_lines` 7.97 + 1.69 + 0.94, `current_total_tax` 10.60, allocations 3.30 + 1.70, DHL 5.90, shop total 76.60).
 
 ## 1.0.2

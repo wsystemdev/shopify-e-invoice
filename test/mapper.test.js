@@ -526,3 +526,39 @@ test("pre-discount 100% code tax-included and tax-excluded, payable 0", () => {
   assert.equal(b3total(be), 11.90);
   assert.equal(payable(be), 0);
 });
+
+test("post-discount stacked 6%+1% tax-excluded (QA 189.85): not mis-detected, payable 0", () => {
+  // 187.43 net, 10.00 code, post-discount tax_lines 10.65+1.77 on 177.43, shop total 189.85.
+  // Before the fix this was mis-read as pre-discount/split: 183.65, payable -6.20.
+  const o = order({
+    taxes_included: false, financial_status: "paid",
+    total_price: "189.85", current_total_price: "189.85", current_total_tax: "12.42",
+    line_items: [{ title: "Widget", quantity: 1, price: "187.43", total_discount: "0.00",
+      discount_allocations: [{ amount: "10.00" }],
+      tax_lines: [{ title: "State", rate: 0.06, price: "10.65" }, { title: "County", rate: 0.01, price: "1.77" }] }],
+    shipping_lines: [],
+  });
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  assert.equal(b.lines.length, 1);
+  assert.equal(b.lines[0].vat_rate, 7);
+  assert.equal(b3total(b), 189.85);
+  assert.equal(b.prepaid_amount, 189.85);
+  assert.equal(payable(b), 0);
+});
+
+test("post-discount stacked 6%+1% tax-included, payable 0", () => {
+  // 128.40 incl. 7 % (6+1), 8.40 code → 120.00; tax_lines already on the discounted amount (6.73+1.12).
+  const o = order({
+    taxes_included: true, financial_status: "paid",
+    total_price: "120.00", current_total_price: "120.00", current_total_tax: "7.85",
+    line_items: [{ title: "Good", quantity: 1, price: "128.40", total_discount: "0.00",
+      discount_allocations: [{ amount: "8.40" }],
+      tax_lines: [{ title: "State", rate: 0.06, price: "6.73" }, { title: "County", rate: 0.01, price: "1.12" }] }],
+    shipping_lines: [],
+  });
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  assert.equal(b.lines.length, 1);
+  assert.equal(b.lines[0].vat_rate, 7);
+  assert.equal(b3total(b), 120);
+  assert.equal(payable(b), 0);
+});

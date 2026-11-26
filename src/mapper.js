@@ -196,7 +196,8 @@ function expectedTaxOnGross(it, includes, gross) {
   const u = undiscGross(it);
   const charged = taxCharged(it);
   const uNet = includes ? r2(u - charged) : u;
-  const stacked = stackedOnNet(tl, uNet);
+  // Post-discount stacked lines fit the discounted net, not uNet; also try this gross.
+  const stacked = stackedOnNet(tl, uNet) || stackedOnNet(tl, includes ? r2(gross - charged) : gross);
   if (stacked) {
     const rate = tl.reduce((a, t) => a + n(t.rate), 0);
     return includes ? r2(gross * rate / (1 + rate)) : r2(gross * rate);
@@ -262,7 +263,7 @@ export function adjustPreDiscountTax(item, includes, grossLine, order) {
   const u = undiscGross(item);
   const charged = taxCharged(item);
   const uNet = includes ? r2(u - charged) : u;
-  const stacked = stackedOnNet(tl, uNet);
+  const stacked = stackedOnNet(tl, uNet) || stackedOnNet(tl, includes ? r2(grossLine - charged) : grossLine);
   let prices;
   if (stacked) {
     const rate = tl.reduce((a, t) => a + n(t.rate), 0);

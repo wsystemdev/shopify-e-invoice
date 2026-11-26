@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import app, { generate, ensureWebhooks, gqlOrderToRest, LINE_NODE } from "../src/index.js";
+import app, { generate, ensureWebhooks, gqlOrderToRest, LINE_NODE, ORDER_FIELDS } from "../src/index.js";
 import { hmac, seal, unseal, verifySessionToken } from "../src/crypto.js";
 
 class KV { constructor() { this.m = new Map(); }
@@ -417,4 +417,19 @@ test("P2 GraphQL: findOrder query requests discountAllocations; gqlOrderToRest m
   assert.equal(o.line_items[0].total_discount, "0.00");
   assert.deepEqual(o.line_items[1].discount_allocations, [{ amount: "1.70" }]);
   assert.deepEqual(o.shipping_lines[0].discount_allocations, [{ amount: "2.00" }]);
+});
+
+test("GraphQL findOrder requests order tax sets; gqlOrderToRest maps them and omits missing ones", () => {
+  assert.match(ORDER_FIELDS, /currentTotalTaxSet/);
+  assert.match(ORDER_FIELDS, /totalTaxSet/);
+  const withTax = gqlOrderToRest({
+    ...GQL_ORDER,
+    currentTotalTaxSet: { shopMoney: { amount: "10.60" } },
+    totalTaxSet: { shopMoney: { amount: "0.00" } },
+  });
+  assert.equal(withTax.current_total_tax, "10.60");
+  assert.equal(withTax.total_tax, "0.00");
+  const missing = gqlOrderToRest(GQL_ORDER);
+  assert.equal(missing.current_total_tax, undefined);
+  assert.equal(missing.total_tax, undefined);
 });

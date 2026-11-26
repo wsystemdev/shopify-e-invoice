@@ -111,8 +111,8 @@ const ADDR = "{ company firstName lastName name address1 address2 city zip count
 const TAXL = `taxLines { rate priceSet ${MONEY} }`;
 const ALLOC = `discountAllocations { allocatedAmountSet ${MONEY} }`;
 export const LINE_NODE = `id title variantTitle sku quantity originalUnitPriceSet ${MONEY} totalDiscountSet ${MONEY} ${ALLOC} ${TAXL}`;
-const ORDER_FIELDS = `id legacyResourceId name createdAt processedAt displayFinancialStatus taxesIncluded currencyCode presentmentCurrencyCode email tags paymentGatewayNames
-  currentTotalPriceSet ${MONEY} totalPriceSet ${MONEY} customAttributes { key value }
+export const ORDER_FIELDS = `id legacyResourceId name createdAt processedAt displayFinancialStatus taxesIncluded currencyCode presentmentCurrencyCode email tags paymentGatewayNames
+  currentTotalPriceSet ${MONEY} totalPriceSet ${MONEY} currentTotalTaxSet ${MONEY} totalTaxSet ${MONEY} customAttributes { key value }
   billingAddress ${ADDR} shippingAddress ${ADDR}
   lineItems(first: 100) { pageInfo { hasNextPage endCursor } nodes { ${LINE_NODE} } }
   shippingLines(first: 10) { nodes { title originalPriceSet ${MONEY} discountedPriceSet ${MONEY} ${ALLOC} ${TAXL} } }`;
@@ -129,6 +129,8 @@ export function gqlOrderToRest(o) {
     financial_status: String(o.displayFinancialStatus || "").toLowerCase().replace(/ /g, "_"), taxes_included: !!o.taxesIncluded, currency: o.currencyCode, presentment_currency: o.presentmentCurrencyCode,
     email: o.email || "", tags: (o.tags || []).join(", "), payment_gateway_names: o.paymentGatewayNames || [],
     current_total_price: amt(o.currentTotalPriceSet), total_price: amt(o.totalPriceSet),
+    ...(o.currentTotalTaxSet && o.currentTotalTaxSet.shopMoney ? { current_total_tax: amt(o.currentTotalTaxSet) } : {}),
+    ...(o.totalTaxSet && o.totalTaxSet.shopMoney ? { total_tax: amt(o.totalTaxSet) } : {}),
     note_attributes: (o.customAttributes || []).map((a) => ({ name: a.key, value: a.value })),
     billing_address: addr(o.billingAddress), shipping_address: addr(o.shippingAddress),
     line_items: ((o.lineItems && o.lineItems.nodes) || []).map((x) => ({ id: String(x.id || "").split("/").pop(), title: x.title, variant_title: x.variantTitle || "", sku: x.sku || "", quantity: x.quantity, price: amt(x.originalUnitPriceSet), total_discount: amt(x.totalDiscountSet), discount_allocations: allocs(x), tax_lines: tl(x) })),
