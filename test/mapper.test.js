@@ -97,3 +97,26 @@ test("credit note payment: IBAN set -> means 58 with IBAN (BR-61); no IBAN -> me
   const w = buildCreditNote(o2(), refund, { ...S, seller_iban: "DE02 1203 0000 0000 2020 51" }); assert.equal(w.payment.means_code, "58"); assert.equal(w.payment.iban, "DE02120300000000202051");
   const n = buildCreditNote(o2(), refund, { ...S, seller_iban: "" }); assert.equal(n.payment.means_code, "1"); assert.equal(n.payment.iban, undefined);
 });
+
+// ---- BET3: per-line tax rounding vs base x rate ----
+const b3order = (items, extra = {}) => ({ name: "#B3", currency: "EUR", taxes_included: true, financial_status: "paid", payment_gateway_names: ["paypal"],
+  created_at: "2026-11-24T10:00:00+01:00", billing_address: { company: "Kunde GmbH", country_code: "DE", address1: "Weg 5", city: "München", zip: "80331" },
+  line_items: items.map(([title, qty, price, rate, tax], i) => ({ id: i + 1, title, quantity: qty, price: String(price), total_discount: "0", sku: "", tax_lines: [{ rate, price: String(tax) }] })),
+  shipping_lines: [], ...extra });
+const b3total = (b) => { const by = {}; for (const l of b.lines) by[l.vat_rate] = (by[l.vat_rate] || 0) + Math.round(l.quantity * l.unit_price * 100) / 100;
+  const ov = Object.fromEntries((b.vat_amounts || []).map((v) => [v.vat_rate, v.tax_amount])); let t = 0;
+  for (const [r, x0] of Object.entries(by)) { const x = Math.round(x0 * 100) / 100; t += x + (ov[r] ?? Math.round(x * Number(r)) / 100); } return Math.round(t * 100) / 100; };
+test("BET3: 9.99 incl. 19 % sends the charged VAT as vat_amounts", () => {
+  const b = buildInvoice(b3order([["Pen", 1, 9.99, 0.19, 1.60]]), { seller_country: "DE" }, { today: "2026-11-26" });
+  assert.deepEqual(b.vat_amounts, [{ vat_category: "S", vat_rate: 19, tax_amount: 1.6 }]);
+  assert.equal(b3total(b), 9.99);
+});
+test("BET3: mixed rates, total equals order total", () => {
+  const b = buildInvoice(b3order([["Pen", 3, 9.99, 0.19, 4.79], ["Book", 2, 12.95, 0.07, 1.69], ["Coffee", 1, 4.99, 0.07, 0.33]]), { seller_country: "DE" }, { today: "2026-11-26" });
+  assert.equal(b3total(b), 60.86);
+});
+test("BET3: exact orders carry no vat_amounts", () => {
+  const b = buildInvoice(b3order([["Service", 1, 119, 0.19, 19]]), { seller_country: "DE" }, { today: "2026-11-26" });
+  assert.equal(b.vat_amounts, undefined);
+  assert.equal(b3total(b), 119);
+});

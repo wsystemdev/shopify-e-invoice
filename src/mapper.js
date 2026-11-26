@@ -37,9 +37,9 @@ function taxInfo(item, includes, grossLine, zeroCat) {
   const tax = tl.reduce((a, t) => a + n(t.price), 0);
   const rate = tl.reduce((a, t) => a + n(t.rate), 0) * 100;
   const net = includes ? grossLine - tax : grossLine;
-  if (rate > 0) return { net, cat: "S", rate: r2(rate) };
-  if (Math.abs(net) > 0 && Math.abs(tax) > 0) return { net, cat: "S", rate: Math.round((tax / net) * 1000) / 10 };
-  return { net, cat: zeroCat, rate: 0 };
+  if (rate > 0) return { net, tax: r2(tax), cat: "S", rate: r2(rate) };
+  if (Math.abs(net) > 0 && Math.abs(tax) > 0) return { net, tax: r2(tax), cat: "S", rate: Math.round((tax / net) * 1000) / 10 };
+  return { net, tax: 0, cat: zeroCat, rate: 0 };
 }
 
 function line(desc, qty, net, v, sku) {
@@ -53,6 +53,26 @@ function line(desc, qty, net, v, sku) {
   const l = { description: String(desc), quantity: qty, unit: "C62", unit_price: price, vat_rate: v.rate, vat_category: v.cat };
   if (sku) l.seller_item_id = String(sku);
   return l;
+}
+
+// BET3: Shopify rounds tax per line; the API computes VAT per rate as base x rate. Per rate, where they differ, first try a net within
+// 3 cents on the last line of that rate that reaches the same gross (works with every API version); otherwise send the VAT Shopify
+// charged as vat_amounts (used by the W System API once supported, ignored before). Keeps the e-invoice total = the order total.
+export function reconcile(raw) {
+  const groups = {};
+  raw.forEach((l, i) => { if (l.cat === "S") (groups[l.rate] = groups[l.rate] || []).push(i); });
+  const va = []; const tol = Math.max(0.01, r2(0.005 * raw.length));
+  for (const [rate, idx] of Object.entries(groups)) {
+    const r = Number(rate);
+    const net = r2(idx.reduce((a, i) => a + r2(raw[i].net), 0)); const tax = r2(idx.reduce((a, i) => a + (raw[i].tax || 0), 0));
+    const gross = r2(net + tax);
+    if (Math.abs(r2(net * r / 100) - tax) < 0.001) continue;
+    let best = null;
+    for (let d = -3; d <= 3; d++) { const x = r2(net + d / 100); if (Math.abs(r2(x + r2(x * r / 100)) - gross) < 0.001 && (best === null || Math.abs(d) < Math.abs(best))) best = d; }
+    if (best !== null) { const last = idx[idx.length - 1]; raw[last] = { ...raw[last], net: r2(r2(raw[last].net) + best / 100) }; }
+    else if (Math.abs(r2(net * r / 100) - tax) <= tol + 0.0001) va.push({ vat_category: "S", vat_rate: r, tax_amount: tax });
+  }
+  return { raw, vat_amounts: va };
 }
 
 const berlinDate = (d = new Date()) => new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Berlin" }).format(d);
@@ -78,20 +98,23 @@ export function buildInvoice(order, s, opts = {}) {
   const includes = !!order.taxes_included;
   const zero = zeroCat(order, set);
 
-  const lines = [];
+  let raw = [];
   for (const it of order.line_items || []) {
     const qty = n(it.quantity);
     const disc = n(it.total_discount);
     const gross = n(it.price) * qty - disc;
     const t = taxInfo(it, includes, gross, zero);
-    lines.push(line(it.title + (it.variant_title ? ` (${it.variant_title})` : ""), qty, t.net, t, it.sku));
+    raw.push({ desc: it.title + (it.variant_title ? ` (${it.variant_title})` : ""), qty, sku: it.sku, ...t });
   }
   for (const it of order.shipping_lines || []) {
     const gross = n(it.discounted_price != null ? it.discounted_price : it.price);
     if (r2(gross) === 0) continue;
     const t = taxInfo(it, includes, gross, zero);
-    lines.push(line(`Shipping: ${it.title}`, 1, t.net, t));
+    raw.push({ desc: `Shipping: ${it.title}`, qty: 1, ...t });
   }
+  let vatAmounts = [];
+  if (!small) ({ raw, vat_amounts: vatAmounts } = reconcile(raw));
+  const lines = raw.map((x) => line(x.desc, x.qty, x.net, x, x.sku));
   if (small) for (const l of lines) { l.vat_category = "E"; l.vat_rate = 0; }
 
   const name = `${ba.first_name || ""} ${ba.last_name || ""}`.trim() || ba.name || "";
@@ -144,6 +167,7 @@ export function buildInvoice(order, s, opts = {}) {
     order_reference: orderNumber(order),
     seller: strip(seller), buyer: strip(buyer), lines, payment,
   };
+  if (vatAmounts.length) body.vat_amounts = vatAmounts;
   if (paid) body.prepaid_amount = r2(n(order.current_total_price != null ? order.current_total_price : order.total_price));
   if (small) body.vat_exemption_reason = { E: "No VAT charged under the small business scheme (section 19 UStG)." };
   return body;
@@ -169,7 +193,7 @@ export function buildCreditNote(order, refund, s, opts = {}) {
   const base = buildInvoice(order, set, opts);
   const includes = !!order.taxes_included;
   const zero = zeroCat(order, set);
-  const lines = [];
+  let raw = [];
   for (const rl of refund.refund_line_items || []) {
     const it = (order.line_items || []).find((x) => String(x.id) === String(rl.line_item_id || (rl.line_item && rl.line_item.id)));
     if (!it) continue;
@@ -178,7 +202,7 @@ export function buildCreditNote(order, refund, s, opts = {}) {
     const rate = (it.tax_lines || []).reduce((a, t) => a + n(t.rate), 0);
     const gross = n(rl.subtotal);                      // refunded amount of this line (tax-inclusive when the shop shows prices with tax)
     const t = taxInfo({ tax_lines: [{ rate, price: n(rl.total_tax) }] }, includes, gross, zero);
-    lines.push(line(it.title + (it.variant_title ? ` (${it.variant_title})` : ""), qty, t.net, t, it.sku));
+    raw.push({ desc: it.title + (it.variant_title ? ` (${it.variant_title})` : ""), qty, sku: it.sku, ...t });
   }
   for (const a of refund.order_adjustments || []) {
     if (a.kind !== "shipping_refund") continue;
@@ -188,11 +212,15 @@ export function buildCreditNote(order, refund, s, opts = {}) {
     const rate = (ship.tax_lines || []).reduce((x, t) => x + n(t.rate), 0);
     // shipping_refund.amount is tax-exclusive in Shopify's payload; add the tax back when the shop shows prices with tax so taxInfo can split it
     const t = taxInfo({ tax_lines: [{ rate, price: tax }] }, includes, includes ? gross + tax : gross, zero);
-    lines.push(line("Shipping (refund)", 1, t.net, t));
+    raw.push({ desc: "Shipping (refund)", qty: 1, ...t });
   }
+  let vatAmounts = [];
+  if (set.small_business !== "yes") ({ raw, vat_amounts: vatAmounts } = reconcile(raw));
+  const lines = raw.map((x) => line(x.desc, x.qty, x.net, x, x.sku));
   if (set.small_business === "yes") for (const l of lines) { l.vat_category = "E"; l.vat_rate = 0; }
   const body = { ...base, lines };
-  delete body.prepaid_amount;
+  delete body.prepaid_amount; delete body.vat_amounts;
+  if (vatAmounts.length) body.vat_amounts = vatAmounts;
   const orig = base.invoice_number;
   body.invoice_number = `${set.invoice_prefix || ""}CN-${orderNumber(order)}-${String(refund.id || "").slice(-6)}`;
   body.type_code = "381";
