@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3
+
+- When Shopify leaves `tax_lines` at the tax on the undiscounted price (the line or order tax matches tax on the original price, not on the discounted price), net is recomputed from the discounted gross at the line's rate(s). `tax_lines` that are already post-discount are left unchanged, so Shopify's charged VAT is still used for reconcile / `vat_amounts`.
+- A paid discounted order then has payable 0.00, including the real #1016 shape (pre-discount `tax_lines` 7.97 + 1.69 + 0.94, `current_total_tax` 10.60, allocations 3.30 + 1.70, DHL 5.90, shop total 76.60).
+
 ## 1.0.2
 
 - Discount codes that only appear in `discount_allocations` (with `total_discount` left at 0.00) are applied on the webhook path and on GraphQL `/api/create` (`findOrder`). A paid order's prepaid amount then matches the e-invoice total (payable 0).

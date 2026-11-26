@@ -46,9 +46,10 @@ function taxInfo(item, includes, grossLine, zeroCat) {
 // PC-3: a price taxed at several rates. Two shapes exist: stacked taxes on the SAME base (e.g. US state + county: the rates add up,
 // one line) and a price SPLIT over rates (EU shipping/bundles in a 19 % + 7 % cart: each rate taxes its own share of the net; summing
 // the rates gave one line at 26 %). Split when the bases implied by tax/rate add up to the net; otherwise keep the summed rate.
-export function taxParts(item, includes, grossLine, zeroCat) {
+export function taxParts(item, includes, grossLine, zeroCat, order) {
   // PC-11: keep a positive rate even when that share's tax rounded to 0.00, otherwise a tiny 7 % (or 19 %)
   // shipping share is dropped and the rest is mapped as one line at the summed 26 %.
+  item = adjustPreDiscountTax(item, includes, grossLine, order);
   const tl = (item.tax_lines || []).filter((t) => n(t.rate) > 0);
   const one = taxInfo(item, includes, grossLine, zeroCat);
   if (tl.length < 2 || one.cat !== "S") return [one];
@@ -163,6 +164,132 @@ export function shippingGross(it) {
   return r2(price - allocatedDiscount(it));
 }
 
+
+// When Shopify leaves tax_lines at the tax on the undiscounted price (common on
+// constructed / draft / Admin-API orders with a discount code), net = discounted
+// gross − that tax is wrong and the engine total misses the shop total. Detect
+// that shape (line tax, or the order tax, matches tax on the undiscounted price
+// rather than on the discounted price) and recompute net from the discounted
+// gross at the line's rate(s). Already post-discount tax_lines are left alone.
+const CENT = 0.011;
+export function undiscGross(it) {
+  const price = n(it.price);
+  if (it.quantity != null && String(it.quantity) !== "") return r2(price * n(it.quantity));
+  return r2(price);
+}
+function taxCharged(it) {
+  return r2((it.tax_lines || []).reduce((s, t) => s + n(t.price), 0));
+}
+function rateLines(it) {
+  return (it.tax_lines || []).filter((t) => n(t.rate) > 0);
+}
+function stackedOnNet(tl, net) {
+  if (tl.length < 2) return true;
+  return tl.every((t) => {
+    const e = n(t.price) / n(t.rate);
+    return Math.abs(e - net) <= 0.005 / n(t.rate) + 0.011;
+  });
+}
+function expectedTaxOnGross(it, includes, gross) {
+  const tl = rateLines(it);
+  if (!tl.length || r2(gross) === 0) return 0;
+  const u = undiscGross(it);
+  const charged = taxCharged(it);
+  const uNet = includes ? r2(u - charged) : u;
+  const stacked = stackedOnNet(tl, uNet);
+  if (stacked) {
+    const rate = tl.reduce((a, t) => a + n(t.rate), 0);
+    return includes ? r2(gross * rate / (1 + rate)) : r2(gross * rate);
+  }
+  const est = tl.map((t) => n(t.price) / n(t.rate));
+  const shares = includes ? est.map((e, i) => e + n(tl[i].price)) : est;
+  const denom = shares.reduce((a, b) => a + b, 0) || 1;
+  let left = r2(gross);
+  let tax = 0;
+  tl.forEach((t, i) => {
+    const g = i === tl.length - 1 ? left : r2(gross * shares[i] / denom);
+    left = r2(left - g);
+    tax = r2(tax + (includes ? r2(g * n(t.rate) / (1 + n(t.rate))) : r2(g * n(t.rate))));
+  });
+  return tax;
+}
+function orderTaxAmount(order) {
+  if (!order) return null;
+  if (order.current_total_tax != null && String(order.current_total_tax) !== "" && Math.abs(n(order.current_total_tax)) > 0.0001) {
+    return r2(n(order.current_total_tax));
+  }
+  if (order.total_tax != null && String(order.total_tax) !== "") return r2(n(order.total_tax));
+  return null;
+}
+function lineDiscGross(it) {
+  if (it.quantity != null && String(it.quantity) !== "") return r2(n(it.price) * n(it.quantity) - allocatedDiscount(it));
+  return shippingGross(it);
+}
+function orderExpectedTaxes(order, includes) {
+  let undisc = 0, disc = 0;
+  for (const it of [...(order.line_items || []), ...(order.shipping_lines || [])]) {
+    if (it == null || it.price == null || it.price === "") continue;
+    undisc = r2(undisc + expectedTaxOnGross(it, includes, undiscGross(it)));
+    disc = r2(disc + expectedTaxOnGross(it, includes, lineDiscGross(it)));
+  }
+  return { undisc, disc };
+}
+export function looksPreDiscount(it, includes, discGross, order) {
+  if (it == null || it.price == null || it.price === "") return false;
+  const u = undiscGross(it);
+  if (Math.abs(u - n(discGross)) < 0.001) return false;
+  const charged = taxCharged(it);
+  const tU = expectedTaxOnGross(it, includes, u);
+  const tD = expectedTaxOnGross(it, includes, discGross);
+  const near = (a, b) => Math.abs(a - b) <= CENT;
+  if (near(charged, tD) && !near(charged, tU)) return false;
+  if (near(charged, tU) && !near(charged, tD)) return true;
+  if (near(tU, tD)) return false;
+  if (order) {
+    const ot = orderTaxAmount(order);
+    if (ot != null) {
+      const sums = orderExpectedTaxes(order, includes);
+      if (near(ot, sums.undisc) && !near(ot, sums.disc)) return true;
+      if (near(ot, sums.disc) && !near(ot, sums.undisc)) return false;
+    }
+  }
+  return Math.abs(charged - tU) < Math.abs(charged - tD);
+}
+export function adjustPreDiscountTax(item, includes, grossLine, order) {
+  if (!looksPreDiscount(item, includes, grossLine, order)) return item;
+  const tl = rateLines(item);
+  if (!tl.length) return item;
+  const u = undiscGross(item);
+  const charged = taxCharged(item);
+  const uNet = includes ? r2(u - charged) : u;
+  const stacked = stackedOnNet(tl, uNet);
+  let prices;
+  if (stacked) {
+    const rate = tl.reduce((a, t) => a + n(t.rate), 0);
+    const tax = includes ? r2(grossLine * rate / (1 + rate)) : r2(grossLine * rate);
+    if (tl.length === 1) prices = [tax];
+    else {
+      let left = tax;
+      prices = tl.map((t, i) => {
+        const p = i === tl.length - 1 ? left : r2(tax * n(t.rate) / rate);
+        left = r2(left - p);
+        return p;
+      });
+    }
+  } else {
+    const est = tl.map((t) => n(t.price) / n(t.rate));
+    const shares = includes ? est.map((e, i) => e + n(tl[i].price)) : est;
+    const denom = shares.reduce((a, b) => a + b, 0) || 1;
+    let left = r2(grossLine);
+    prices = tl.map((t, i) => {
+      const g = i === tl.length - 1 ? left : r2(grossLine * shares[i] / denom);
+      left = r2(left - g);
+      return includes ? r2(g * n(t.rate) / (1 + n(t.rate))) : r2(g * n(t.rate));
+    });
+  }
+  return { ...item, tax_lines: tl.map((t, i) => ({ ...t, price: prices[i] })) };
+}
+
 export function buildInvoice(order, s, opts = {}) {
   const set = { ...DEFAULT_SETTINGS, ...s };
   const sc = String(set.seller_country || "DE").toUpperCase();
@@ -179,12 +306,12 @@ export function buildInvoice(order, s, opts = {}) {
     const disc = allocatedDiscount(it);
     const gross = n(it.price) * qty - disc;
     const desc = it.title + (it.variant_title ? ` (${it.variant_title})` : "");
-    for (const t of taxParts(it, includes, gross, zero)) raw.push(t.split ? { desc: `${qty !== 1 ? `${qty} x ` : ""}${desc} (${t.rate} %)`, qty: 1, sku: it.sku, ...t } : { desc, qty, sku: it.sku, ...t });
+    for (const t of taxParts(it, includes, gross, zero, order)) raw.push(t.split ? { desc: `${qty !== 1 ? `${qty} x ` : ""}${desc} (${t.rate} %)`, qty: 1, sku: it.sku, ...t } : { desc, qty, sku: it.sku, ...t });
   }
   for (const it of order.shipping_lines || []) {
     const gross = shippingGross(it);
     if (r2(gross) === 0) continue;
-    for (const t of taxParts(it, includes, gross, zero)) raw.push({ desc: t.split ? `Shipping: ${it.title} (${t.rate} %)` : `Shipping: ${it.title}`, qty: 1, ...t });
+    for (const t of taxParts(it, includes, gross, zero, order)) raw.push({ desc: t.split ? `Shipping: ${it.title} (${t.rate} %)` : `Shipping: ${it.title}`, qty: 1, ...t });
   }
   let vatAmounts = [];
   if (!small) ({ raw, vat_amounts: vatAmounts } = reconcile(raw));
@@ -296,7 +423,7 @@ export function buildCreditNote(order, refund, s, opts = {}) {
       const rate = origLines.reduce((x, t) => x + n(t.rate), 0) || (ship.tax_lines || []).reduce((x, t) => x + n(t.rate), 0);
       taxLines = [{ rate, price: tax }];
     }
-    for (const part of taxParts({ tax_lines: taxLines }, includes, refundGross, zero)) {
+    for (const part of taxParts({ tax_lines: taxLines }, includes, refundGross, zero, order)) {
       raw.push({ desc: part.split ? `Shipping (refund) (${part.rate} %)` : "Shipping (refund)", qty: 1, ...part });
     }
   }

@@ -106,6 +106,7 @@ const b3order = (items, extra = {}) => ({ name: "#B3", currency: "EUR", taxes_in
 const b3total = (b) => { const by = {}; for (const l of b.lines) by[l.vat_rate] = (by[l.vat_rate] || 0) + Math.round(l.quantity * l.unit_price * 100) / 100;
   const ov = Object.fromEntries((b.vat_amounts || []).map((v) => [v.vat_rate, v.tax_amount])); let t = 0;
   for (const [r, x0] of Object.entries(by)) { const x = Math.round(x0 * 100) / 100; t += x + (ov[r] ?? Math.round(x * Number(r)) / 100); } return Math.round(t * 100) / 100; };
+const payable = (b) => Math.round((b3total(b) - (b.prepaid_amount || 0)) * 100) / 100;
 test("BET3: 9.99 incl. 19 % sends the charged VAT as vat_amounts", () => {
   const b = buildInvoice(b3order([["Pen", 1, 9.99, 0.19, 1.60]]), { seller_country: "DE" }, { today: "2026-11-26" });
   assert.deepEqual(b.vat_amounts, [{ vat_category: "S", vat_rate: 19, tax_amount: 1.6 }]);
@@ -262,6 +263,7 @@ test("P2 #1016: discount code allocations apply when total_discount is 0, payabl
   const b = buildInvoice(o, S, { today: "2026-11-26" });
   assert.equal(b.prepaid_amount, 76.60);
   assert.equal(b3total(b), 76.60);
+  assert.equal(payable(b), 0);
   assert.equal(b.lines.length, 2);
 });
 
@@ -283,6 +285,7 @@ test("P2: mixed line discount plus code allocations are not double-counted", () 
   const b = buildInvoice(o, S, { today: "2026-11-26" });
   assert.equal(b.prepaid_amount, 46.50);
   assert.equal(b3total(b), 46.50);
+  assert.equal(payable(b), 0);
 });
 
 test("P2: shipping discount_allocations are applied, and discounted_price is not double-counted", () => {
@@ -297,6 +300,7 @@ test("P2: shipping discount_allocations are applied, and discounted_price is not
   assert.ok(ship, JSON.stringify(b.lines));
   assert.equal(ship.unit_price, 3.9);
   assert.equal(b3total(b), 64.14);
+  assert.equal(payable(b), 0);
   const already = order({
     ...shipAlloc,
     shipping_lines: [{ title: "DHL", price: "5.90", discounted_price: "3.90", discount_allocations: [{ amount: "2.00" }], tax_lines: [{ rate: 0.19, price: "0.74" }] }],
@@ -305,6 +309,7 @@ test("P2: shipping discount_allocations are applied, and discounted_price is not
   const ship2 = b2.lines.find((l) => /Shipping: DHL/.test(l.description));
   assert.equal(ship2.unit_price, 3.9);
   assert.equal(b3total(b2), 64.14);
+  assert.equal(payable(b2), 0);
 });
 
 test("P2: 100% discount code on a line yields unit_price 0", () => {
@@ -326,4 +331,198 @@ test("P2: 100% discount code on a line yields unit_price 0", () => {
   assert.equal(gift.unit_price, 0);
   assert.equal(b.prepaid_amount, 10);
   assert.equal(b3total(b), 10);
+  assert.equal(payable(b), 0);
+});
+
+test("P2 #1016 real shape: pre-discount tax_lines and current_total_tax 10.60, total 76.60 / payable 0", () => {
+  // Replay of the Admin-API #1016 shape (QA holds the live payload): taxes_included,
+  // QA-FIX5 5.00 split 3.30 + 1.70, total_discount 0.00, tax_lines still on the
+  // undiscounted prices (7.97 + 1.69 + 0.94 = current_total_tax 10.60), DHL 5.90.
+  const o = order({
+    name: "#1016", taxes_included: true, financial_status: "paid",
+    total_price: "76.60", current_total_price: "76.60", current_total_tax: "10.60", total_tax: "0.00",
+    total_discounts: "5.00", payment_gateway_names: ["manual"],
+    line_items: [
+      { title: "QA Kessel", sku: "QA-K", quantity: 1, price: "49.90", total_discount: "0.00",
+        discount_allocations: [{ amount: "3.30", discount_application_index: 0 }],
+        tax_lines: [{ price: "7.97", rate: 0.19, title: "MwSt" }] },
+      { title: "QA Buch", sku: "QA-B", quantity: 2, price: "12.90", total_discount: "0.00",
+        discount_allocations: [{ amount: "1.70", discount_application_index: 0 }],
+        tax_lines: [{ price: "1.69", rate: 0.07, title: "MwSt" }] },
+    ],
+    shipping_lines: [{ title: "DHL Paket", price: "5.90", discounted_price: "5.90", discount_allocations: [],
+      tax_lines: [{ price: "0.94", rate: 0.19, title: "MwSt" }] }],
+  });
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  assert.equal(b.prepaid_amount, 76.60);
+  assert.equal(b3total(b), 76.60);
+  assert.equal(payable(b), 0);
+});
+
+test("pre-discount tax_lines stay untouched when they are already post-discount", () => {
+  // Same merch as the unit #1016 (no shipping): tax already on 46.60 / 30.00.
+  const o = order({
+    name: "#1016", taxes_included: true, financial_status: "paid",
+    total_price: "76.60", current_total_price: "76.60", current_total_tax: "12.23",
+    line_items: [
+      { title: "A", quantity: 1, price: "49.90", total_discount: "0.00",
+        discount_allocations: [{ amount: "3.30" }],
+        tax_lines: [{ rate: 0.19, price: "7.44" }] },
+      { title: "B", quantity: 1, price: "31.70", total_discount: "0.00",
+        discount_allocations: [{ amount: "1.70" }],
+        tax_lines: [{ rate: 0.19, price: "4.79" }] },
+    ],
+    shipping_lines: [],
+  });
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  assert.equal(b3total(b), 76.60);
+  assert.equal(payable(b), 0);
+});
+
+test("pre-discount stacked 6%+1%, tax-excluded: recompute and payable 0", () => {
+  const net = 187.43, disc = 20.00, after = 167.43;
+  const o = order({
+    taxes_included: false, financial_status: "paid",
+    total_price: "179.15", current_total_price: "179.15", current_total_tax: "13.12",
+    line_items: [{ title: "Good", quantity: 1, price: String(net), total_discount: "0.00",
+      discount_allocations: [{ amount: String(disc) }],
+      tax_lines: [{ rate: 0.06, price: "11.25" }, { rate: 0.01, price: "1.87" }] }],
+    shipping_lines: [],
+  });
+  // post-discount tax 167.43*0.06=10.05, *0.01=1.67, total 167.43+11.72=179.15
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  assert.equal(b.lines.length, 1);
+  assert.equal(b.lines[0].vat_rate, 7);
+  assert.equal(b3total(b), 179.15);
+  assert.equal(payable(b), 0);
+});
+
+test("pre-discount stacked 6%+1%, tax-included: recompute and payable 0", () => {
+  // 200.55 incl. 7 % (6+1) on 187.43 net; 20.00 code → 180.55; tax on 200.55 is 13.12 (pre)
+  const o = order({
+    taxes_included: true, financial_status: "paid",
+    total_price: "180.55", current_total_price: "180.55", current_total_tax: "13.12",
+    line_items: [{ title: "Good", quantity: 1, price: "200.55", total_discount: "0.00",
+      discount_allocations: [{ amount: "20.00" }],
+      tax_lines: [{ rate: 0.06, price: "11.25" }, { rate: 0.01, price: "1.87" }] }],
+    shipping_lines: [],
+  });
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  assert.equal(b.lines.length, 1);
+  assert.equal(b.lines[0].vat_rate, 7);
+  assert.equal(b3total(b), 180.55);
+  assert.equal(payable(b), 0);
+});
+
+test("pre-discount mixed 19/7 tax-excluded, payable 0", () => {
+  // 50.00 @19% tax 9.50 + 20.00 @7% tax 1.40; code 5.00 split 3.57 + 1.43
+  // after: 46.43*0.19=8.82, 18.57*0.07=1.30, total 75.12
+  const o = order({
+    taxes_included: false, financial_status: "paid",
+    total_price: "75.12", current_total_price: "75.12", current_total_tax: "10.90",
+    line_items: [
+      { title: "A", quantity: 1, price: "50.00", total_discount: "0.00",
+        discount_allocations: [{ amount: "3.57" }],
+        tax_lines: [{ rate: 0.19, price: "9.50" }] },
+      { title: "B", quantity: 1, price: "20.00", total_discount: "0.00",
+        discount_allocations: [{ amount: "1.43" }],
+        tax_lines: [{ rate: 0.07, price: "1.40" }] },
+    ],
+    shipping_lines: [],
+  });
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  assert.equal(b3total(b), 75.12);
+  assert.equal(payable(b), 0);
+});
+
+test("pre-discount mixed 19/7 tax-included, payable 0", () => {
+  // 49.90 @19% tax 7.97 + 25.80 @7% tax 1.69; 5.00 split 3.30 + 1.70 → 46.60 + 24.10 = 70.70
+  const o = order({
+    taxes_included: true, financial_status: "paid",
+    total_price: "70.70", current_total_price: "70.70", current_total_tax: "9.66",
+    line_items: [
+      { title: "A", quantity: 1, price: "49.90", total_discount: "0.00",
+        discount_allocations: [{ amount: "3.30" }],
+        tax_lines: [{ rate: 0.19, price: "7.97" }] },
+      { title: "B", quantity: 2, price: "12.90", total_discount: "0.00",
+        discount_allocations: [{ amount: "1.70" }],
+        tax_lines: [{ rate: 0.07, price: "1.69" }] },
+    ],
+    shipping_lines: [],
+  });
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  assert.equal(b3total(b), 70.70);
+  assert.equal(payable(b), 0);
+});
+
+test("pre-discount shipping allocation, tax-included and tax-excluded, payable 0", () => {
+  const incl = order({
+    taxes_included: true, financial_status: "paid",
+    total_price: "65.90", current_total_price: "65.90", current_total_tax: "10.52",
+    line_items: [{ title: "W", quantity: 1, price: "62.00", total_discount: "0.00",
+      tax_lines: [{ rate: 0.19, price: "9.90" }] }],
+    shipping_lines: [{ title: "DHL", price: "5.90", discount_allocations: [{ amount: "2.00" }],
+      tax_lines: [{ rate: 0.19, price: "0.94" }] }],
+  });
+  const bi = buildInvoice(incl, S, { today: "2026-11-26" });
+  const shipi = bi.lines.find((l) => /Shipping: DHL/.test(l.description));
+  assert.ok(shipi);
+  assert.equal(Math.round(shipi.unit_price * 100) / 100, 3.28); // 3.90 incl 19 %
+  assert.equal(b3total(bi), 65.90);
+  assert.equal(payable(bi), 0);
+
+  const excl = order({
+    taxes_included: false, financial_status: "paid",
+    total_price: "64.14", current_total_price: "64.14", current_total_tax: "10.62",
+    line_items: [{ title: "W", quantity: 1, price: "50.00", total_discount: "0.00",
+      tax_lines: [{ rate: 0.19, price: "9.50" }] }],
+    shipping_lines: [{ title: "DHL", price: "5.90", discount_allocations: [{ amount: "2.00" }],
+      tax_lines: [{ rate: 0.19, price: "1.12" }] }], // pre-discount tax on 5.90
+  });
+  const be = buildInvoice(excl, S, { today: "2026-11-26" });
+  const shipe = be.lines.find((l) => /Shipping: DHL/.test(l.description));
+  assert.ok(shipe);
+  assert.equal(shipe.unit_price, 3.9);
+  assert.equal(b3total(be), 64.14);
+  assert.equal(payable(be), 0);
+});
+
+test("pre-discount 100% code tax-included and tax-excluded, payable 0", () => {
+  const incl = order({
+    taxes_included: true, financial_status: "paid",
+    total_price: "10.00", current_total_price: "10.00", current_total_tax: "4.79",
+    line_items: [
+      { title: "Gift", quantity: 2, price: "10.00", total_discount: "0.00",
+        discount_allocations: [{ amount: "20.00" }],
+        tax_lines: [{ rate: 0.19, price: "3.19" }] }, // pre-discount tax on 20.00 incl
+      { title: "Real", quantity: 1, price: "10.00", total_discount: "0.00",
+        tax_lines: [{ rate: 0.19, price: "1.60" }] },
+    ],
+    shipping_lines: [],
+  });
+  const bi = buildInvoice(incl, S, { today: "2026-11-26" });
+  const gift = bi.lines.find((l) => l.description === "Gift");
+  assert.ok(gift);
+  assert.equal(gift.unit_price, 0);
+  assert.equal(b3total(bi), 10);
+  assert.equal(payable(bi), 0);
+
+  const excl = order({
+    taxes_included: false, financial_status: "paid",
+    total_price: "11.90", current_total_price: "11.90", current_total_tax: "5.70",
+    line_items: [
+      { title: "Gift", quantity: 2, price: "10.00", total_discount: "0.00",
+        discount_allocations: [{ amount: "20.00" }],
+        tax_lines: [{ rate: 0.19, price: "3.80" }] },
+      { title: "Real", quantity: 1, price: "10.00", total_discount: "0.00",
+        tax_lines: [{ rate: 0.19, price: "1.90" }] },
+    ],
+    shipping_lines: [],
+  });
+  const be = buildInvoice(excl, S, { today: "2026-11-26" });
+  const gifte = be.lines.find((l) => l.description === "Gift");
+  assert.ok(gifte);
+  assert.equal(gifte.unit_price, 0);
+  assert.equal(b3total(be), 11.90);
+  assert.equal(payable(be), 0);
 });

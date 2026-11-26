@@ -1,6 +1,6 @@
 {
   "name": "w-system-e-invoice-shopify",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "W System E-Invoice for Shopify: XRechnung 3.0, EN 16931 and Peppol BIS e-invoices from orders (Cloudflare Worker).",
   "type": "module",
   "license": "MIT",
