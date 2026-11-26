@@ -1,7 +1,10 @@
 // E2E against the dev store + live Worker + live API. Secrets only from files, never printed.
+// Live API calls (validate) are deny-listed unless ALLOW_PROD=1.
 import fs from "fs";
 import { hmac } from "../src/crypto.js";
 import { ensureWebhooks } from "../src/index.js";
+import { requireAllowProd } from "/workspace/growth/bets/deny_prod.mjs";
+requireAllowProd("https://api.wsystem.dev/einvoice/validate", "shopify e2e/run.mjs");
 const rd = (p) => Object.fromEntries(fs.readFileSync(p, "utf8").split("\n").filter((l) => l.includes("=") && !l.startsWith("#")).map((l) => { const i = l.indexOf("="); return [l.slice(0, i), l.slice(i + 1).replace(/^["']|["']$/g, "")]; }));
 const app = rd("/workspace/growth/secrets/shopify_app.env"), e2e = rd("/workspace/growth/secrets/shopware_e2e.env");
 const ENC = fs.readFileSync("/workspace/growth/secrets/shopify_enc_key.txt", "utf8").trim();
