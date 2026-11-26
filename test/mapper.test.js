@@ -147,3 +147,41 @@ test("PC-4: 3 x 9.99 (19 %) + 4.99 (7 %) gives 34.96 on APIs with and without va
   assert.equal(r2x(neu), 34.96);
   assert.equal(vm[19], 4.79);
 });
+
+test("PC-8: 49.50 × 19 % rounds to 9.41 (integer cents), so vat_amounts or the total match the shop", () => {
+  const { raw, vat_amounts: va } = reconcile([{ desc: "A", qty: 1, net: 49.50, tax: 9.41, cat: "S", rate: 19 }]);
+  const net = raw.reduce((a, l) => a + l.net, 0);
+  const calc = Number(Math.round((net * 19) / 100 + "e+2") + "e-2");
+  const tax = va.length ? va[0].tax_amount : calc;
+  assert.equal(Number(Math.round(net + tax + "e+2") + "e-2"), 58.91);
+  // r2 itself must not turn 9.405 into 9.40
+  const shopTax = Number(Math.round(49.50 * 0.19 + "e+2") + "e-2");
+  assert.equal(shopTax, 9.41);
+});
+
+test("PC-11: split shipping keeps a 0.00-tax tiny share as its own rate, not one 26 % line", () => {
+  const ship = { tax_lines: [{ rate: 0.19, price: "1.11" }, { rate: 0.07, price: "0.00" }] };
+  const p = taxParts(ship, true, 6.99, "Z");
+  assert.ok(p.length === 2, JSON.stringify(p));
+  assert.deepEqual(p.map((x) => x.rate), [19, 7]);
+  assert.equal(p.find((x) => x.rate === 7).tax, 0);
+});
+
+test("PC-9: credit note splits mixed-rate shipping refund per rate, not one line at 26 %", () => {
+  const order = {
+    name: "#1001", currency: "EUR", taxes_included: true, financial_status: "paid",
+    billing_address: { first_name: "A", last_name: "B", address1: "S 1", city: "Berlin", zip: "10115", country_code: "DE", company: "Kunde GmbH" },
+    line_items: [{ id: 1, title: "Pen", quantity: 1, price: "11.90", sku: "P", tax_lines: [{ rate: 0.19, price: "1.90" }] }],
+    shipping_lines: [{ title: "DHL", price: "5.30", tax_lines: [{ rate: 0.19, price: "0.40" }, { rate: 0.07, price: "0.18" }] }],
+  };
+  const refund = {
+    id: 99, created_at: "2026-11-26T00:00:00+01:00",
+    refund_line_items: [{ line_item_id: 1, quantity: 1, subtotal: "11.90", total_tax: "1.90" }],
+    order_adjustments: [{ kind: "shipping_refund", amount: "-4.72", tax_amount: "-0.58" }],
+  };
+  const b = buildCreditNote(order, refund, { seller_country: "DE", credit_notes: "yes" }, { today: "2026-11-26" });
+  const ships = b.lines.filter((l) => /Shipping/.test(l.description));
+  assert.ok(ships.length === 2, JSON.stringify(b.lines));
+  assert.deepEqual(ships.map((l) => l.vat_rate).sort((a, b) => a - b), [7, 19]);
+  assert.ok(!ships.some((l) => l.vat_rate === 26));
+});

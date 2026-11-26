@@ -2,7 +2,8 @@
 // Mirrors woo-e-invoice class-wsei-mapper.php.
 export const EU = ["AT","BE","BG","CY","CZ","DE","DK","EE","ES","FI","FR","GR","HR","HU","IE","IT","LT","LU","LV","MT","NL","PL","PT","RO","SE","SI","SK"];
 const n = (v) => { const x = parseFloat(v); return Number.isFinite(x) ? x : 0; };
-const r2 = (x) => Math.round((x + Number.EPSILON) * 100) / 100;
+// PC-8: integer-cent rounding. (x + EPS) * 100 mis-rounds half cents (49.50 × 19 % → 9.40 instead of 9.41).
+const r2 = (x) => Number(Math.round(Number(x) + "e+2") + "e-2");
 
 export const DEFAULT_SETTINGS = {
   api_key: "", format: "xrechnung", trigger: "paid", only_b2b: "no", small_business: "no",
@@ -46,17 +47,22 @@ function taxInfo(item, includes, grossLine, zeroCat) {
 // one line) and a price SPLIT over rates (EU shipping/bundles in a 19 % + 7 % cart: each rate taxes its own share of the net; summing
 // the rates gave one line at 26 %). Split when the bases implied by tax/rate add up to the net; otherwise keep the summed rate.
 export function taxParts(item, includes, grossLine, zeroCat) {
-  const tl = (item.tax_lines || []).filter((t) => n(t.rate) > 0 && n(t.price) !== 0);
+  // PC-11: keep a positive rate even when that share's tax rounded to 0.00, otherwise a tiny 7 % (or 19 %)
+  // shipping share is dropped and the rest is mapped as one line at the summed 26 %.
+  const tl = (item.tax_lines || []).filter((t) => n(t.rate) > 0);
   const one = taxInfo(item, includes, grossLine, zeroCat);
   if (tl.length < 2 || one.cat !== "S") return [one];
   const net = one.net;
   const est = tl.map((t) => n(t.price) / n(t.rate));
   const sumEst = est.reduce((a, b) => a + b, 0);
-  const maxEst = Math.max(...est);
-  if (Math.abs(sumEst - net) >= Math.abs(maxEst - net)) return [one];   // stacked on the same base
+  // Stacked = each implied base is the full net (state + county). A tiny 0.00-tax share has an implied
+  // base of 0, so it is a split, not stacked, even though sumEst is then close to maxEst.
+  const stacked = est.every((e) => Math.abs(e - net) <= 0.05) && Math.abs(sumEst - net * tl.length) <= 0.10;
+  if (stacked) return [one];
   const out = []; let left = r2(net);
+  const denom = sumEst || 1;
   tl.forEach((t, i) => {
-    const part = i === tl.length - 1 ? r2(left) : r2(net * est[i] / sumEst);
+    const part = i === tl.length - 1 ? r2(left) : r2(net * est[i] / denom);
     left = r2(left - part);
     out.push({ net: part, tax: r2(n(t.price)), cat: "S", rate: r2(n(t.rate) * 100), split: true });
   });
@@ -253,10 +259,22 @@ export function buildCreditNote(order, refund, s, opts = {}) {
     const gross = Math.abs(n(a.amount)) , tax = Math.abs(n(a.tax_amount));
     if (r2(gross) === 0) continue;
     const ship = (order.shipping_lines || [])[0] || {};
-    const rate = (ship.tax_lines || []).reduce((x, t) => x + n(t.rate), 0);
-    // shipping_refund.amount is tax-exclusive in Shopify's payload; add the tax back when the shop shows prices with tax so taxInfo can split it
-    const t = taxInfo({ tax_lines: [{ rate, price: tax }] }, includes, includes ? gross + tax : gross, zero);
-    raw.push({ desc: "Shipping (refund)", qty: 1, ...t });
+    // PC-9: refund mixed-rate shipping with one line per original rate, not one "Shipping (refund)" at the summed rate.
+    // shipping_refund.amount is tax-exclusive; add the tax back when the shop shows prices with tax.
+    const refundGross = includes ? gross + tax : gross;
+    const origGross = n(ship.discounted_price != null ? ship.discounted_price : ship.price) || 0;
+    const origLines = (ship.tax_lines || []).filter((t) => n(t.rate) > 0);
+    let taxLines;
+    if (origLines.length >= 2 && origGross) {
+      const factor = refundGross / origGross;
+      taxLines = origLines.map((t) => ({ rate: t.rate, price: r2(n(t.price) * factor) }));
+    } else {
+      const rate = origLines.reduce((x, t) => x + n(t.rate), 0) || (ship.tax_lines || []).reduce((x, t) => x + n(t.rate), 0);
+      taxLines = [{ rate, price: tax }];
+    }
+    for (const part of taxParts({ tax_lines: taxLines }, includes, refundGross, zero)) {
+      raw.push({ desc: part.split ? `Shipping (refund) (${part.rate} %)` : "Shipping (refund)", qty: 1, ...part });
+    }
   }
   let vatAmounts = [];
   if (set.small_business !== "yes") ({ raw, vat_amounts: vatAmounts } = reconcile(raw));
