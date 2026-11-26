@@ -109,18 +109,20 @@ async function shopifyGql(env, shop, token, query, variables) {
 const MONEY = "{ shopMoney { amount } }";
 const ADDR = "{ company firstName lastName name address1 address2 city zip countryCodeV2 }";
 const TAXL = `taxLines { rate priceSet ${MONEY} }`;
-const LINE_NODE = `id title variantTitle sku quantity originalUnitPriceSet ${MONEY} totalDiscountSet ${MONEY} ${TAXL}`;
+const ALLOC = `discountAllocations { allocatedAmountSet ${MONEY} }`;
+export const LINE_NODE = `id title variantTitle sku quantity originalUnitPriceSet ${MONEY} totalDiscountSet ${MONEY} ${ALLOC} ${TAXL}`;
 const ORDER_FIELDS = `id legacyResourceId name createdAt processedAt displayFinancialStatus taxesIncluded currencyCode presentmentCurrencyCode email tags paymentGatewayNames
   currentTotalPriceSet ${MONEY} totalPriceSet ${MONEY} customAttributes { key value }
   billingAddress ${ADDR} shippingAddress ${ADDR}
   lineItems(first: 100) { pageInfo { hasNextPage endCursor } nodes { ${LINE_NODE} } }
-  shippingLines(first: 10) { nodes { title originalPriceSet ${MONEY} discountedPriceSet ${MONEY} ${TAXL} } }`;
+  shippingLines(first: 10) { nodes { title originalPriceSet ${MONEY} discountedPriceSet ${MONEY} ${ALLOC} ${TAXL} } }`;
 // Convert a GraphQL order into the REST-style shape that the mapper (and the webhook payload) use.
 export function gqlOrderToRest(o) {
   if (!o) return null;
   const amt = (m) => (m && m.shopMoney ? m.shopMoney.amount : "0");
   const addr = (a) => (a ? { company: a.company || "", first_name: a.firstName || "", last_name: a.lastName || "", name: a.name || "", address1: a.address1 || "", address2: a.address2 || "", city: a.city || "", zip: a.zip || "", country_code: a.countryCodeV2 || "" } : null);
   const tl = (x) => (x.taxLines || []).map((t) => ({ rate: t.rate, price: amt(t.priceSet) }));
+  const allocs = (x) => (x.discountAllocations || []).map((d) => ({ amount: amt(d.allocatedAmountSet) }));
   const num = parseInt(String(o.name || "").replace(/\D/g, ""), 10);
   return {
     id: Number(o.legacyResourceId), name: o.name, order_number: Number.isFinite(num) ? num : undefined, created_at: o.createdAt, processed_at: o.processedAt,
@@ -129,8 +131,8 @@ export function gqlOrderToRest(o) {
     current_total_price: amt(o.currentTotalPriceSet), total_price: amt(o.totalPriceSet),
     note_attributes: (o.customAttributes || []).map((a) => ({ name: a.key, value: a.value })),
     billing_address: addr(o.billingAddress), shipping_address: addr(o.shippingAddress),
-    line_items: ((o.lineItems && o.lineItems.nodes) || []).map((x) => ({ id: String(x.id || "").split("/").pop(), title: x.title, variant_title: x.variantTitle || "", sku: x.sku || "", quantity: x.quantity, price: amt(x.originalUnitPriceSet), total_discount: amt(x.totalDiscountSet), tax_lines: tl(x) })),
-    shipping_lines: ((o.shippingLines && o.shippingLines.nodes) || []).map((x) => ({ title: x.title, price: amt(x.originalPriceSet), discounted_price: amt(x.discountedPriceSet), tax_lines: tl(x) })),
+    line_items: ((o.lineItems && o.lineItems.nodes) || []).map((x) => ({ id: String(x.id || "").split("/").pop(), title: x.title, variant_title: x.variantTitle || "", sku: x.sku || "", quantity: x.quantity, price: amt(x.originalUnitPriceSet), total_discount: amt(x.totalDiscountSet), discount_allocations: allocs(x), tax_lines: tl(x) })),
+    shipping_lines: ((o.shippingLines && o.shippingLines.nodes) || []).map((x) => ({ title: x.title, price: amt(x.originalPriceSet), discounted_price: amt(x.discountedPriceSet), discount_allocations: allocs(x), tax_lines: tl(x) })),
   };
 }
 // PC-6: lineItems is a connection (max 100 per page); orders with more lines were cut off at 100 for manual and refund credit notes.

@@ -243,3 +243,87 @@ test("100%-discounted multi-quantity line sends unit_price 0, not null", () => {
     assert.notEqual(gift.unit_price, null);
   }
 });
+
+test("P2 #1016: discount code allocations apply when total_discount is 0, payable 0 on a paid order", () => {
+  // 49.90 + 31.70 = 81.60; QA-FIX5 5.00 split 3.30 + 1.70; shop total / prepaid 76.60
+  const o = order({
+    name: "#1016", taxes_included: true, financial_status: "paid",
+    total_price: "76.60", current_total_price: "76.60", payment_gateway_names: ["shopify_payments"],
+    line_items: [
+      { title: "A", quantity: 1, price: "49.90", total_discount: "0.00",
+        discount_allocations: [{ amount: "3.30", discount_application_index: 0 }],
+        tax_lines: [{ rate: 0.19, price: "7.44" }] },
+      { title: "B", quantity: 1, price: "31.70", total_discount: "0.00",
+        discount_allocations: [{ amount: "1.70", discount_application_index: 0 }],
+        tax_lines: [{ rate: 0.19, price: "4.79" }] },
+    ],
+    shipping_lines: [],
+  });
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  assert.equal(b.prepaid_amount, 76.60);
+  assert.equal(b3total(b), 76.60);
+  assert.equal(b.lines.length, 2);
+});
+
+test("P2: mixed line discount plus code allocations are not double-counted", () => {
+  // total_discount 2.00 (line) plus allocations 2.00 + 1.50 (line + code) => take 3.50, not 2.00 or 5.50
+  const o = order({
+    taxes_included: true, financial_status: "paid",
+    total_price: "46.50", current_total_price: "46.50",
+    line_items: [{
+      title: "A", quantity: 1, price: "50.00", total_discount: "2.00",
+      discount_allocations: [
+        { amount: "2.00", discount_application_index: 0 },
+        { amount: "1.50", discount_application_index: 1 },
+      ],
+      tax_lines: [{ rate: 0.19, price: "7.43" }],
+    }],
+    shipping_lines: [],
+  });
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  assert.equal(b.prepaid_amount, 46.50);
+  assert.equal(b3total(b), 46.50);
+});
+
+test("P2: shipping discount_allocations are applied, and discounted_price is not double-counted", () => {
+  const shipAlloc = {
+    taxes_included: false, financial_status: "paid",
+    total_price: "64.14", current_total_price: "64.14",
+    line_items: [{ title: "W", quantity: 1, price: "50.00", total_discount: "0.00", tax_lines: [{ rate: 0.19, price: "9.50" }] }],
+    shipping_lines: [{ title: "DHL", price: "5.90", discount_allocations: [{ amount: "2.00" }], tax_lines: [{ rate: 0.19, price: "0.74" }] }],
+  };
+  const b = buildInvoice(order(shipAlloc), S, { today: "2026-11-26" });
+  const ship = b.lines.find((l) => /Shipping: DHL/.test(l.description));
+  assert.ok(ship, JSON.stringify(b.lines));
+  assert.equal(ship.unit_price, 3.9);
+  assert.equal(b3total(b), 64.14);
+  const already = order({
+    ...shipAlloc,
+    shipping_lines: [{ title: "DHL", price: "5.90", discounted_price: "3.90", discount_allocations: [{ amount: "2.00" }], tax_lines: [{ rate: 0.19, price: "0.74" }] }],
+  });
+  const b2 = buildInvoice(already, S, { today: "2026-11-26" });
+  const ship2 = b2.lines.find((l) => /Shipping: DHL/.test(l.description));
+  assert.equal(ship2.unit_price, 3.9);
+  assert.equal(b3total(b2), 64.14);
+});
+
+test("P2: 100% discount code on a line yields unit_price 0", () => {
+  const o = order({
+    taxes_included: true, financial_status: "paid",
+    total_price: "10.00", current_total_price: "10.00",
+    line_items: [
+      { title: "Gift", quantity: 2, price: "10.00", total_discount: "0.00",
+        discount_allocations: [{ amount: "20.00", discount_application_index: 0 }],
+        tax_lines: [{ rate: 0.19, price: "0.00" }] },
+      { title: "Real", quantity: 1, price: "10.00", total_discount: "0.00",
+        tax_lines: [{ rate: 0.19, price: "1.60" }] },
+    ],
+    shipping_lines: [],
+  });
+  const b = buildInvoice(o, S, { today: "2026-11-26" });
+  const gift = b.lines.find((l) => l.description === "Gift");
+  assert.ok(gift, JSON.stringify(b.lines));
+  assert.equal(gift.unit_price, 0);
+  assert.equal(b.prepaid_amount, 10);
+  assert.equal(b3total(b), 10);
+});

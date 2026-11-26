@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import app, { generate, ensureWebhooks, gqlOrderToRest } from "../src/index.js";
+import app, { generate, ensureWebhooks, gqlOrderToRest, LINE_NODE } from "../src/index.js";
 import { hmac, seal, unseal, verifySessionToken } from "../src/crypto.js";
 
 class KV { constructor() { this.m = new Map(); }
@@ -391,4 +391,30 @@ test("POST /api/settings with invalid JSON returns 400, not 500", async () => {
   assert.equal(r.status, 400);
   const j = await r.json();
   assert.equal(j.reason, "bad_request");
+});
+
+test("P2 GraphQL: findOrder query requests discountAllocations; gqlOrderToRest maps them", () => {
+  assert.match(LINE_NODE, /discountAllocations/);
+  assert.match(LINE_NODE, /allocatedAmountSet/);
+  const g = {
+    ...GQL_ORDER,
+    currentTotalPriceSet: { shopMoney: { amount: "76.60" } }, totalPriceSet: { shopMoney: { amount: "76.60" } },
+    lineItems: { nodes: [
+      { id: "gid://shopify/LineItem/1", title: "A", variantTitle: "", sku: "", quantity: 1,
+        originalUnitPriceSet: { shopMoney: { amount: "49.90" } }, totalDiscountSet: { shopMoney: { amount: "0.00" } },
+        discountAllocations: [{ allocatedAmountSet: { shopMoney: { amount: "3.30" } } }],
+        taxLines: [{ rate: 0.19, priceSet: { shopMoney: { amount: "7.44" } } }] },
+      { id: "gid://shopify/LineItem/2", title: "B", variantTitle: "", sku: "", quantity: 1,
+        originalUnitPriceSet: { shopMoney: { amount: "31.70" } }, totalDiscountSet: { shopMoney: { amount: "0.00" } },
+        discountAllocations: [{ allocatedAmountSet: { shopMoney: { amount: "1.70" } } }],
+        taxLines: [{ rate: 0.19, priceSet: { shopMoney: { amount: "4.79" } } }] },
+    ] },
+    shippingLines: { nodes: [{ title: "DHL", originalPriceSet: { shopMoney: { amount: "5.90" } }, discountedPriceSet: { shopMoney: { amount: "5.90" } },
+      discountAllocations: [{ allocatedAmountSet: { shopMoney: { amount: "2.00" } } }], taxLines: [{ rate: 0.19, priceSet: { shopMoney: { amount: "0.62" } } }] }] },
+  };
+  const o = gqlOrderToRest(g);
+  assert.deepEqual(o.line_items[0].discount_allocations, [{ amount: "3.30" }]);
+  assert.equal(o.line_items[0].total_discount, "0.00");
+  assert.deepEqual(o.line_items[1].discount_allocations, [{ amount: "1.70" }]);
+  assert.deepEqual(o.shipping_lines[0].discount_allocations, [{ amount: "2.00" }]);
 });

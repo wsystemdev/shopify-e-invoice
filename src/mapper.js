@@ -139,6 +139,30 @@ export function zeroCat(order, set) {
   return "Z";
 }
 
+// Line (or shipping) discount. Discount codes often land only in discount_allocations
+// while total_discount stays 0. Allocations already include any line discount that
+// total_discount also reports, so we use the allocation sum when it is non-zero and
+// otherwise fall back to total_discount — never the two added together.
+export function allocatedDiscount(it) {
+  const allocs = it.discount_allocations || [];
+  const alloc = r2(allocs.reduce((s, a) => {
+    const amt = a.amount != null ? a.amount
+      : (a.amount_set && a.amount_set.shop_money && a.amount_set.shop_money.amount);
+    return s + n(amt);
+  }, 0));
+  const td = n(it.total_discount);
+  return alloc !== 0 ? alloc : td;
+}
+export function shippingGross(it) {
+  const price = n(it.price);
+  if (it.discounted_price != null) {
+    const dp = n(it.discounted_price);
+    // discounted_price already is the shop's shipping charge (including a 100 % off of 0)
+    if (dp !== price || r2(dp) === 0) return dp;
+  }
+  return r2(price - allocatedDiscount(it));
+}
+
 export function buildInvoice(order, s, opts = {}) {
   const set = { ...DEFAULT_SETTINGS, ...s };
   const sc = String(set.seller_country || "DE").toUpperCase();
@@ -152,13 +176,13 @@ export function buildInvoice(order, s, opts = {}) {
   let raw = [];
   for (const it of order.line_items || []) {
     const qty = n(it.quantity);
-    const disc = n(it.total_discount);
+    const disc = allocatedDiscount(it);
     const gross = n(it.price) * qty - disc;
     const desc = it.title + (it.variant_title ? ` (${it.variant_title})` : "");
     for (const t of taxParts(it, includes, gross, zero)) raw.push(t.split ? { desc: `${qty !== 1 ? `${qty} x ` : ""}${desc} (${t.rate} %)`, qty: 1, sku: it.sku, ...t } : { desc, qty, sku: it.sku, ...t });
   }
   for (const it of order.shipping_lines || []) {
-    const gross = n(it.discounted_price != null ? it.discounted_price : it.price);
+    const gross = shippingGross(it);
     if (r2(gross) === 0) continue;
     for (const t of taxParts(it, includes, gross, zero)) raw.push({ desc: t.split ? `Shipping: ${it.title} (${t.rate} %)` : `Shipping: ${it.title}`, qty: 1, ...t });
   }
