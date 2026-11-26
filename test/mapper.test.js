@@ -185,3 +185,61 @@ test("PC-9: credit note splits mixed-rate shipping refund per rate, not one line
   assert.deepEqual(ships.map((l) => l.vat_rate).sort((a, b) => a - b), [7, 19]);
   assert.ok(!ships.some((l) => l.vat_rate === 26));
 });
+
+test("187.43 net stacked 6%+1% stays one line and totals 200.55", () => {
+  const net = 187.43;
+  const t6 = Math.round(net * 0.06 * 100) / 100;
+  const t1 = Math.round(net * 0.01 * 100) / 100;
+  const gross = Math.round((net + t6 + t1) * 100) / 100;
+  assert.equal(t6, 11.25); assert.equal(t1, 1.87); assert.equal(gross, 200.55);
+  const it = { tax_lines: [{ rate: 0.06, price: t6.toFixed(2) }, { rate: 0.01, price: t1.toFixed(2) }] };
+  const p = taxParts(it, false, net, "Z");
+  assert.equal(p.length, 1, JSON.stringify(p));
+  assert.equal(p[0].rate, 7);
+  const b = buildInvoice(order({
+    taxes_included: false, total_price: String(gross), current_total_price: String(gross), financial_status: "paid",
+    line_items: [{ title: "Good", quantity: 1, price: String(net), total_discount: "0.00", tax_lines: it.tax_lines }],
+    shipping_lines: [],
+  }), S, { today: "2026-11-26" });
+  assert.equal(b.lines.length, 1);
+  assert.equal(b.lines[0].vat_rate, 7);
+  const tot = (b.lines || []).reduce((a, l) => a + Math.round(l.quantity * l.unit_price * 100) / 100, 0);
+  const tax = (b.vat_amounts && b.vat_amounts[0] ? b.vat_amounts[0].tax_amount : Math.round(tot * 7) / 100);
+  assert.equal(Math.round((tot + tax) * 100) / 100, 200.55);
+});
+
+test("random stacked fuzz: 0 mis-splits", () => {
+  let s = 20261126;
+  const rnd = () => { s = (s * 1664525 + 1013904223) % 4294967296; return s / 4294967296; };
+  const r2x = (x) => Math.round(x * 100) / 100;
+  const cases = [[[0.06, "s"], [0.01, "c"]], [[0.05, "g"], [0.07, "p"]], [[0.0625, "s"], [0.025, "c"]]];
+  let bad = 0; const N = 2000;
+  for (let i = 0; i < N; i++) {
+    const rates = cases[i % cases.length];
+    const net = r2x(1 + rnd() * 300);
+    const item = { tax_lines: rates.map(([r]) => ({ rate: r, price: r2x(net * r).toFixed(2) })) };
+    const parts = taxParts(item, false, net, "Z");
+    const sumRate = r2x(rates.reduce((a, [r]) => a + r, 0) * 100);
+    if (parts.length !== 1 || Math.abs(parts[0].rate - sumRate) > 0.001) bad++;
+  }
+  assert.equal(bad, 0, `${bad} of ${N} mis-split`);
+});
+
+test("100%-discounted multi-quantity line sends unit_price 0, not null", () => {
+  const mk = (price, qty, disc) => order({
+    taxes_included: true, financial_status: "paid", total_price: "10.00", current_total_price: "10.00",
+    line_items: [
+      { title: "Gift", quantity: qty, price, total_discount: disc, tax_lines: [{ rate: 0.19, price: "0.00" }] },
+      { title: "Real", quantity: 1, price: "10.00", total_discount: "0.00", tax_lines: [{ rate: 0.19, price: "1.60" }] },
+    ],
+    shipping_lines: [],
+  });
+  for (const [p, q, d] of [["19.90", 3, "59.70"], ["0.10", 3, "0.30"], ["9.99", 1, "9.99"], ["33.33", 3, "99.99"], ["4.95", 7, "34.65"]]) {
+    const b = buildInvoice(mk(p, q, d), S, { today: "2026-11-26" });
+    const gift = b.lines.find((l) => l.description === "Gift");
+    assert.ok(gift, `missing Gift line for ${q} x ${p} -${d}: ` + JSON.stringify(b.lines));
+    assert.equal(gift.unit_price, 0);
+    assert.equal(Number.isNaN(gift.unit_price), false);
+    assert.notEqual(gift.unit_price, null);
+  }
+});

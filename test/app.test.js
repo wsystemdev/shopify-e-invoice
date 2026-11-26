@@ -224,7 +224,7 @@ test("customers/data_request exports the requested invoice records; redact and s
 test("billing: managed plans, hosted pricing page url, plan matching by name or handle", async () => {
   const e = env(); await seedShop(e, {}); const h = { authorization: "Bearer " + await jwt(claims()) };
   const call = async (path, body) => (await app.fetch(new Request("https://wsystem.dev/shopify" + path, { method: body ? "POST" : "GET", headers: h, body: body && JSON.stringify(body) }), e, ctx())).json();
-  const b = await call("/api/billing"); assert.equal(b.live, true); assert.equal(b.plans.length, 4); assert.equal(b.pricing_url, "https://admin.shopify.com/store/demo/charges/w-system-e-invoice/pricing_plans");
+  const b = await call("/api/billing"); assert.equal(b.live, true); assert.equal(b.plans.length, 4); assert.equal(b.free_invoices, 50); assert.equal(b.plans.find((p) => p.id === "free").invoices, 50); assert.equal(b.pricing_url, "https://admin.shopify.com/store/demo/charges/w-system-e-invoice/pricing_plans");
   assert.equal((await call("/api/billing/subscribe", {})).url, b.pricing_url);
   const { matchPlan, DEFAULT_PLANS } = await import("../src/index.js");
   for (const [sub, id] of [[{ name: "Shop Plus" }, "shop_plus"], [{ name: "W System Shop Pro" }, "shop_pro"], [{ name: "x", handle: "shop" }, "shop"], [{ name: "Free" }, "free"]]) assert.equal(matchPlan(DEFAULT_PLANS, sub).id, id);
@@ -382,4 +382,13 @@ test("PC-6: single page needs no extra query", async () => {
   const node = { id: "x", lineItems: { nodes: [{ id: "1" }], pageInfo: { hasNextPage: false } } };
   const full = await allLineItems(async () => { throw new Error("no call expected"); }, node);
   assert.equal(full.lineItems.nodes.length, 1);
+});
+
+test("POST /api/settings with invalid JSON returns 400, not 500", async () => {
+  const e = env(); await seedShop(e);
+  const h = { authorization: "Bearer " + await jwt(claims()), "content-type": "application/json" };
+  const r = await app.fetch(new Request("https://app.example/api/settings", { method: "POST", headers: h, body: "{not json" }), e, ctx());
+  assert.equal(r.status, 400);
+  const j = await r.json();
+  assert.equal(j.reason, "bad_request");
 });

@@ -3,7 +3,7 @@
 export const EU = ["AT","BE","BG","CY","CZ","DE","DK","EE","ES","FI","FR","GR","HR","HU","IE","IT","LT","LU","LV","MT","NL","PL","PT","RO","SE","SI","SK"];
 const n = (v) => { const x = parseFloat(v); return Number.isFinite(x) ? x : 0; };
 // PC-8: integer-cent rounding. (x + EPS) * 100 mis-rounds half cents (49.50 × 19 % → 9.40 instead of 9.41).
-const r2 = (x) => Number(Math.round(Number(x) + "e+2") + "e-2");
+const r2 = (x) => { const v = Number(x); return Math.sign(v) * Math.round(Number((Math.abs(v) * 100).toPrecision(15))) / 100 + 0; };   // integer-cent rounding without exponent strings (no NaN for 5e-17)
 
 export const DEFAULT_SETTINGS = {
   api_key: "", format: "xrechnung", trigger: "paid", only_b2b: "no", small_business: "no",
@@ -57,7 +57,7 @@ export function taxParts(item, includes, grossLine, zeroCat) {
   const sumEst = est.reduce((a, b) => a + b, 0);
   // Stacked = each implied base is the full net (state + county). A tiny 0.00-tax share has an implied
   // base of 0, so it is a split, not stacked, even though sumEst is then close to maxEst.
-  const stacked = est.every((e) => Math.abs(e - net) <= 0.05) && Math.abs(sumEst - net * tl.length) <= 0.10;
+  const stacked = est.every((e, i) => Math.abs(e - net) <= 0.005 / n(tl[i].rate) + 0.011);   // each implied base = full net, within that tax's own cent rounding
   if (stacked) return [one];
   const out = []; let left = r2(net);
   const denom = sumEst || 1;

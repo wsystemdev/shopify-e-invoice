@@ -442,7 +442,10 @@ export default {
           return json({ settings: s });
         }
         if (path === "/api/settings" && req.method === "POST") {
-          const d = await req.json(); const s = { ...sd.settings };
+          let d;
+          try { d = await req.json(); } catch (e) { return json({ error: "invalid json", reason: "bad_request" }, 400); }
+          if (!d || typeof d !== "object" || Array.isArray(d)) return json({ error: "invalid json", reason: "bad_request" }, 400);
+          const s = { ...sd.settings };
           for (const k of Object.keys(DEFAULT_SETTINGS)) {
             if (typeof d[k] !== "string") continue;
             if (k === "api_key" && (d[k] === "********" || d[k].trim() === "")) continue; // never wipe a stored key with a blank field
@@ -475,7 +478,11 @@ export default {
           await audit(env, shop, "data-request-read", "");
           return new Response(JSON.stringify({ requests: items }), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
         }
-        if (path === "/api/billing" && req.method === "GET") return json({ live: plansOf(env).length > 0, plans: plansOf(env).map(({ ws, ...x }) => x), pricing_url: pricingUrl(env, shop), managed_key: !!sd.settings.api_key_managed, free_invoices: 25 });
+        if (path === "/api/billing" && req.method === "GET") {
+          const plans = plansOf(env);
+          const free = plans.find((p) => p.id === "free" || p.handle === "free" || p.ws === "shop_free");
+          return json({ live: plans.length > 0, plans: plans.map(({ ws, ...x }) => x), pricing_url: pricingUrl(env, shop), managed_key: !!sd.settings.api_key_managed, free_invoices: free && free.invoices != null ? free.invoices : 50 });
+        }
         if (path === "/api/billing/sync" && req.method === "POST") return json(await syncBilling(env, shop, sd));
         if (path === "/api/billing/subscribe" && req.method === "POST") return json({ ok: true, url: pricingUrl(env, shop) }); // hosted Shopify plan page (managed pricing)
         if (path === "/api/create" && req.method === "POST") {
