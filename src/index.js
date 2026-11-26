@@ -109,10 +109,11 @@ async function shopifyGql(env, shop, token, query, variables) {
 const MONEY = "{ shopMoney { amount } }";
 const ADDR = "{ company firstName lastName name address1 address2 city zip countryCodeV2 }";
 const TAXL = `taxLines { rate priceSet ${MONEY} }`;
-const ORDER_FIELDS = `legacyResourceId name createdAt processedAt displayFinancialStatus taxesIncluded currencyCode presentmentCurrencyCode email tags paymentGatewayNames
+const LINE_NODE = `id title variantTitle sku quantity originalUnitPriceSet ${MONEY} totalDiscountSet ${MONEY} ${TAXL}`;
+const ORDER_FIELDS = `id legacyResourceId name createdAt processedAt displayFinancialStatus taxesIncluded currencyCode presentmentCurrencyCode email tags paymentGatewayNames
   currentTotalPriceSet ${MONEY} totalPriceSet ${MONEY} customAttributes { key value }
   billingAddress ${ADDR} shippingAddress ${ADDR}
-  lineItems(first: 100) { nodes { id title variantTitle sku quantity originalUnitPriceSet ${MONEY} totalDiscountSet ${MONEY} ${TAXL} } }
+  lineItems(first: 100) { pageInfo { hasNextPage endCursor } nodes { ${LINE_NODE} } }
   shippingLines(first: 10) { nodes { title originalPriceSet ${MONEY} discountedPriceSet ${MONEY} ${TAXL} } }`;
 // Convert a GraphQL order into the REST-style shape that the mapper (and the webhook payload) use.
 export function gqlOrderToRest(o) {
@@ -132,11 +133,28 @@ export function gqlOrderToRest(o) {
     shipping_lines: ((o.shippingLines && o.shippingLines.nodes) || []).map((x) => ({ title: x.title, price: amt(x.originalPriceSet), discounted_price: amt(x.discountedPriceSet), tax_lines: tl(x) })),
   };
 }
+// PC-6: lineItems is a connection (max 100 per page); orders with more lines were cut off at 100 for manual and refund credit notes.
+// Fetch the remaining pages with the cursor (cap 50 pages = 5,000 lines; the API takes at most 500 lines per document anyway).
+export async function allLineItems(gql, node) {
+  if (!node || !node.lineItems) return node;
+  const nodes = [...(node.lineItems.nodes || [])];
+  let info = node.lineItems.pageInfo || {};
+  for (let page = 1; info.hasNextPage && info.endCursor && page < 50; page++) {
+    const d = await gql(`query($id: ID!, $after: String!) { order(id: $id) { lineItems(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { ${LINE_NODE} } } } }`,
+      { id: node.id, after: info.endCursor });
+    const li = (d.order && d.order.lineItems) || {};
+    nodes.push(...(li.nodes || []));
+    info = li.pageInfo || {};
+  }
+  if (info.hasNextPage) throw new Error("Order has more than 5,000 line items");
+  return { ...node, lineItems: { nodes, pageInfo: { hasNextPage: false } } };
+}
 async function findOrder(env, shop, token, digits) {
-  const d = await shopifyGql(env, shop, token, `query($q: String!) { orders(first: 1, query: $q) { nodes { ${ORDER_FIELDS} } } }`, { q: `name:#${digits}` });
+  const gql = (q, v) => shopifyGql(env, shop, token, q, v);
+  const d = await gql(`query($q: String!) { orders(first: 1, query: $q) { nodes { ${ORDER_FIELDS} } } }`, { q: `name:#${digits}` });
   let node = ((d.orders && d.orders.nodes) || [])[0];
-  if (!node && digits.length > 8) { const g = await shopifyGql(env, shop, token, `query($id: ID!) { order(id: $id) { ${ORDER_FIELDS} } }`, { id: `gid://shopify/Order/${digits}` }); node = g.order; }
-  return gqlOrderToRest(node);
+  if (!node && digits.length > 8) { const g = await gql(`query($id: ID!) { order(id: $id) { ${ORDER_FIELDS} } }`, { id: `gid://shopify/Order/${digits}` }); node = g.order; }
+  return gqlOrderToRest(await allLineItems(gql, node));
 }
 // Shopify only accepts expiring offline tokens (1 h) with a refresh token (90 days).
 async function tokenRequest(env, shop, params) {

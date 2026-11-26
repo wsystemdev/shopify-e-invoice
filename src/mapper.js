@@ -42,6 +42,27 @@ function taxInfo(item, includes, grossLine, zeroCat) {
   return { net, tax: 0, cat: zeroCat, rate: 0 };
 }
 
+// PC-3: a price taxed at several rates. Two shapes exist: stacked taxes on the SAME base (e.g. US state + county: the rates add up,
+// one line) and a price SPLIT over rates (EU shipping/bundles in a 19 % + 7 % cart: each rate taxes its own share of the net; summing
+// the rates gave one line at 26 %). Split when the bases implied by tax/rate add up to the net; otherwise keep the summed rate.
+export function taxParts(item, includes, grossLine, zeroCat) {
+  const tl = (item.tax_lines || []).filter((t) => n(t.rate) > 0 && n(t.price) !== 0);
+  const one = taxInfo(item, includes, grossLine, zeroCat);
+  if (tl.length < 2 || one.cat !== "S") return [one];
+  const net = one.net;
+  const est = tl.map((t) => n(t.price) / n(t.rate));
+  const sumEst = est.reduce((a, b) => a + b, 0);
+  const maxEst = Math.max(...est);
+  if (Math.abs(sumEst - net) >= Math.abs(maxEst - net)) return [one];   // stacked on the same base
+  const out = []; let left = r2(net);
+  tl.forEach((t, i) => {
+    const part = i === tl.length - 1 ? r2(left) : r2(net * est[i] / sumEst);
+    left = r2(left - part);
+    out.push({ net: part, tax: r2(n(t.price)), cat: "S", rate: r2(n(t.rate) * 100), split: true });
+  });
+  return out;
+}
+
 function line(desc, qty, net, v, sku) {
   qty = n(qty); net = r2(net);
   if (qty <= 0) qty = 1;
@@ -55,22 +76,46 @@ function line(desc, qty, net, v, sku) {
   return l;
 }
 
-// BET3: Shopify rounds tax per line; the API computes VAT per rate as base x rate. Per rate, where they differ, first try a net within
-// 3 cents on the last line of that rate that reaches the same gross (works with every API version); otherwise send the VAT Shopify
-// charged as vat_amounts (used by the W System API once supported, ignored before). Keeps the e-invoice total = the order total.
+// BET3 / PC-4 / PC-5 (same rules as the Shopware plugin's reconcile()): Shopify rounds tax per line; the API rounds each line net to
+// cents (EN 16931) and computes VAT per rate as base x rate. Per rate, where the gross differs, first try a net within 3 cents on that
+// rate's last line that reaches the same gross (works with every API version). Second pass: if a rate's gross cannot be reached by any
+// net (e.g. 3 x 9.99 incl. 19 %), shift another rate's net by 1-2 cents so the e-invoice total equals the order total on today's API.
+// Then vat_amounts carries, per rate, the gross Shopify charged minus the net sent, wherever base x rate misses it and the difference
+// is within the API's per-line rounding bound (0.005 per line, min 0.01, max 0.99): with an API that supports vat_amounts every rate's
+// gross is exact; API versions without it ignore the field.
+const apiTotal = (raw) => {
+  const by = {};
+  for (const l of raw) { const k = `${l.cat}|${l.rate}`; by[k] = (by[k] || 0) + r2(l.net); }
+  return r2(Object.entries(by).reduce((a, [k, v]) => { const x = r2(v); const rt = l2rate(k); return a + x + r2(x * rt / 100); }, 0));
+};
+const l2rate = (k) => (k.startsWith("S|") ? Number(k.slice(2)) : 0);
 export function reconcile(raw) {
+  raw = raw.map((l) => ({ ...l, net: r2(l.net), gross: r2(r2(l.net) + (l.cat === "S" ? (l.tax || 0) : 0)) }));
   const groups = {};
   raw.forEach((l, i) => { if (l.cat === "S") (groups[l.rate] = groups[l.rate] || []).push(i); });
-  const va = []; const tol = Math.max(0.01, r2(0.005 * raw.length));
+  const lastOf = (idx) => { const q1 = idx.filter((i) => Math.abs(n(raw[i].qty)) === 1); return q1.length ? q1[q1.length - 1] : idx[idx.length - 1]; };
+  const gsum = (idx, f) => r2(idx.reduce((a, i) => a + raw[i][f], 0));
   for (const [rate, idx] of Object.entries(groups)) {
-    const r = Number(rate);
-    const net = r2(idx.reduce((a, i) => a + r2(raw[i].net), 0)); const tax = r2(idx.reduce((a, i) => a + (raw[i].tax || 0), 0));
-    const gross = r2(net + tax);
-    if (Math.abs(r2(net * r / 100) - tax) < 0.001) continue;
+    const r = Number(rate); const net = gsum(idx, "net"); const gross = gsum(idx, "gross");
+    if (Math.abs(r2(net + r2(net * r / 100)) - gross) < 0.001) continue;
     let best = null;
     for (let d = -3; d <= 3; d++) { const x = r2(net + d / 100); if (Math.abs(r2(x + r2(x * r / 100)) - gross) < 0.001 && (best === null || Math.abs(d) < Math.abs(best))) best = d; }
-    if (best !== null) { const last = idx[idx.length - 1]; raw[last] = { ...raw[last], net: r2(r2(raw[last].net) + best / 100) }; }
-    else if (Math.abs(r2(net * r / 100) - tax) <= tol + 0.0001) va.push({ vat_category: "S", vat_rate: r, tax_amount: tax });
+    if (best !== null) { const k = lastOf(idx); raw[k] = { ...raw[k], net: r2(raw[k].net + best / 100) }; }
+  }
+  const target = r2(raw.reduce((a, l) => a + l.gross, 0));
+  if (Math.abs(apiTotal(raw) - target) > 0.001) {
+    outer: for (const d of [1, -1, 2, -2]) {
+      for (const idx of Object.values(groups)) {
+        const k = lastOf(idx); const tr = raw.slice(); tr[k] = { ...tr[k], net: r2(tr[k].net + d / 100) };
+        if (Math.abs(apiTotal(tr) - target) < 0.001) { raw = tr; break outer; }
+      }
+    }
+  }
+  const tol = Math.min(0.99, Math.max(0.01, r2(0.005 * raw.length)));
+  const va = [];
+  for (const [rate, idx] of Object.entries(groups)) {
+    const r = Number(rate); const net = gsum(idx, "net"); const charged = r2(gsum(idx, "gross") - net); const calc = r2(net * r / 100);
+    if (Math.abs(charged - calc) > 0.001 && Math.abs(charged - calc) <= tol + 0.0001) va.push({ vat_category: "S", vat_rate: r, tax_amount: charged });
   }
   return { raw, vat_amounts: va };
 }
@@ -103,14 +148,13 @@ export function buildInvoice(order, s, opts = {}) {
     const qty = n(it.quantity);
     const disc = n(it.total_discount);
     const gross = n(it.price) * qty - disc;
-    const t = taxInfo(it, includes, gross, zero);
-    raw.push({ desc: it.title + (it.variant_title ? ` (${it.variant_title})` : ""), qty, sku: it.sku, ...t });
+    const desc = it.title + (it.variant_title ? ` (${it.variant_title})` : "");
+    for (const t of taxParts(it, includes, gross, zero)) raw.push(t.split ? { desc: `${qty !== 1 ? `${qty} x ` : ""}${desc} (${t.rate} %)`, qty: 1, sku: it.sku, ...t } : { desc, qty, sku: it.sku, ...t });
   }
   for (const it of order.shipping_lines || []) {
     const gross = n(it.discounted_price != null ? it.discounted_price : it.price);
     if (r2(gross) === 0) continue;
-    const t = taxInfo(it, includes, gross, zero);
-    raw.push({ desc: `Shipping: ${it.title}`, qty: 1, ...t });
+    for (const t of taxParts(it, includes, gross, zero)) raw.push({ desc: t.split ? `Shipping: ${it.title} (${t.rate} %)` : `Shipping: ${it.title}`, qty: 1, ...t });
   }
   let vatAmounts = [];
   if (!small) ({ raw, vat_amounts: vatAmounts } = reconcile(raw));

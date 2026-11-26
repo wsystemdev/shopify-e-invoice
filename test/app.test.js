@@ -358,3 +358,28 @@ test("refunds/create without an original valid e-invoice creates no credit note"
   try { await wh(e, "/webhooks/refunds-create", REFUND, "refunds/create"); } finally { globalThis.fetch = orig; }
   assert.equal(calls.filter((c) => c.includes("api.test")).length, 0); assert.equal(await e.STORE.get(`inv:${SHOP}:cn-${REFUND.id}`), null);
 });
+
+// PC-6: orders with more than 100 line items are fetched page by page
+import { allLineItems } from "../src/index.js";
+test("PC-6: allLineItems follows the lineItems cursor (250 lines)", async () => {
+  const mk = (from, to) => Array.from({ length: to - from }, (_, i) => ({ id: `gid://shopify/LineItem/${from + i}`, title: `L${from + i}`, quantity: 1 }));
+  const calls = [];
+  const gql = async (q, v) => {
+    calls.push(v);
+    assert.match(q, /lineItems\(first: 100, after: \$after\)/);
+    if (v.after === "c100") return { order: { lineItems: { nodes: mk(100, 200), pageInfo: { hasNextPage: true, endCursor: "c200" } } } };
+    if (v.after === "c200") return { order: { lineItems: { nodes: mk(200, 250), pageInfo: { hasNextPage: false, endCursor: "c250" } } } };
+    throw new Error("unexpected cursor " + v.after);
+  };
+  const node = { id: "gid://shopify/Order/9", name: "#1009", lineItems: { nodes: mk(0, 100), pageInfo: { hasNextPage: true, endCursor: "c100" } } };
+  const full = await allLineItems(gql, node);
+  assert.equal(full.lineItems.nodes.length, 250);
+  assert.deepEqual(calls.map((c) => c.after), ["c100", "c200"]);
+  assert.equal(calls[0].id, "gid://shopify/Order/9");
+  assert.equal(gqlOrderToRest(full).line_items.length, 250);
+});
+test("PC-6: single page needs no extra query", async () => {
+  const node = { id: "x", lineItems: { nodes: [{ id: "1" }], pageInfo: { hasNextPage: false } } };
+  const full = await allLineItems(async () => { throw new Error("no call expected"); }, node);
+  assert.equal(full.lineItems.nodes.length, 1);
+});

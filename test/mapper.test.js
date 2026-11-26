@@ -120,3 +120,30 @@ test("BET3: exact orders carry no vat_amounts", () => {
   assert.equal(b.vat_amounts, undefined);
   assert.equal(b3total(b), 119);
 });
+
+// PC-3 / PC-4: split-rate shipping and cross-rate total reconcile
+import { taxParts, reconcile } from "../src/mapper.js";
+test("PC-3: shipping taxed 19 % + 7 % on split bases becomes two lines, not one 26 % line", () => {
+  const ship = { tax_lines: [{ rate: 0.19, price: "0.40" }, { rate: 0.07, price: "0.18" }] }; // 2.10 net @19 + 2.62 net @7 (≈), gross 5.30
+  const p = taxParts(ship, true, 5.30, "Z");
+  assert.equal(p.length, 2);
+  assert.deepEqual(p.map((x) => x.rate), [19, 7]);
+  assert.equal(Math.round((p[0].net + p[1].net) * 100) / 100, 4.72);
+});
+test("PC-3: stacked taxes on the same base (state + county) keep one line at the summed rate", () => {
+  const it = { tax_lines: [{ rate: 0.06, price: "6.00" }, { rate: 0.02, price: "2.00" }] };
+  const p = taxParts(it, false, 100, "Z");
+  assert.equal(p.length, 1); assert.equal(p[0].rate, 8);
+});
+test("PC-4: 3 x 9.99 (19 %) + 4.99 (7 %) gives 34.96 on APIs with and without vat_amounts", () => {
+  const raw = [{ desc: "A", qty: 3, net: 25.18, tax: 4.79, cat: "S", rate: 19 }, { desc: "B", qty: 1, net: 4.66, tax: 0.33, cat: "S", rate: 7 }];
+  const { raw: out, vat_amounts: va } = reconcile(raw);
+  const by = {}; for (const l of out) by[l.rate] = Math.round(((by[l.rate] || 0) + l.net) * 100) / 100;
+  const r2x = (x) => Math.round(x * 100) / 100;
+  const old = Object.entries(by).reduce((a, [r, v]) => a + v + r2x(v * r / 100), 0);
+  assert.equal(r2x(old), 34.96);
+  const vm = Object.fromEntries(va.map((v) => [v.vat_rate, v.tax_amount]));
+  const neu = Object.entries(by).reduce((a, [r, v]) => a + v + (vm[r] ?? r2x(v * r / 100)), 0);
+  assert.equal(r2x(neu), 34.96);
+  assert.equal(vm[19], 4.79);
+});
